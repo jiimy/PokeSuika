@@ -15,6 +15,12 @@ const nextConfig: NextConfig = {
       },
     },
   },
+  sassOptions: {
+    additionalData: `
+    @use "@/assets/styles/mixins" as *;
+    @use "@/assets/styles/variables" as *;
+  `,
+  },
 };
 
 export default nextConfig;

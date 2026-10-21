@@ -1,7 +1,5 @@
 import { createAdminClient } from '@/utils/supabase/admin';
 
-export const dynamic = 'force-dynamic';
-
 /**
  * GET /api/supabase-health
  * .env 의 Supabase URL·service_role 로 연결 가능한지 확인합니다.
