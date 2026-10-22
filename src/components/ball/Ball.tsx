@@ -16,6 +16,7 @@ import {
   SKILLS,
   type SkillId,
 } from '@/constants/skills';
+import BasicModal from '@/components/portalModal/basicModal/BasicModal';
 import type { ReplayAction, ReplayData } from '@/types/replay';
 import { getOrCreateGuestIdentity } from '@/utils/guestId';
 import { ReplayRecorder } from '@/utils/replayRecorder';
@@ -172,6 +173,7 @@ export default function Ball({
   const [buffLabel, setBuffLabel] = useState('');
   const [boundTierId, setBoundTierId] = useState<number | null>(null);
   const [replaySaveMsg, setReplaySaveMsg] = useState('');
+  const [savePromptOpen, setSavePromptOpen] = useState(false);
 
   const currentTierRef = useRef(0);
   const nextTierRef = useRef(1);
@@ -185,6 +187,11 @@ export default function Ball({
     setCurrentTierId(cur);
     setNextTierId(next);
   }, []);
+
+  const syncScoreRef = useRef<(value: number) => void>(() => {});
+  const syncPpRef = useRef<(value: number) => void>(() => {});
+  const setOverRef = useRef<(over: boolean) => void>(() => {});
+  const clearComboUiSoonRef = useRef<() => void>(() => {});
 
   const syncScore = useCallback(
     (value: number) => {
@@ -243,7 +250,7 @@ export default function Ball({
   }, [onGuestSession, onReplaySaved]);
 
   const setOver = useCallback(
-    (over: boolean) => {
+    (over: boolean, options?: { save?: boolean }) => {
       gameOverRef.current = over;
       if (over) {
         playingRef.current = false;
@@ -261,7 +268,12 @@ export default function Ball({
           setAimMode(null);
           aimModeRef.current = null;
           trickPickRef.current = null;
-          void saveReplay();
+          // 기본은 자동 저장. 빠른종료는 save:false 후 모달에서 선택
+          if (options?.save === false) {
+            recorderRef.current.stop();
+          } else {
+            void saveReplay();
+          }
         }
       }
       onGameOverChange?.(over);
@@ -364,6 +376,13 @@ export default function Ball({
       comboClearTimerRef.current = null;
     }, 1200);
   }, []);
+
+  useEffect(() => {
+    syncScoreRef.current = syncScore;
+    syncPpRef.current = syncPp;
+    setOverRef.current = setOver;
+    clearComboUiSoonRef.current = clearComboUiSoon;
+  }, [syncScore, syncPp, setOver, clearComboUiSoon]);
 
   const dropBallAt = useCallback(
     (dropX: number, tierId: number, record: boolean) => {
@@ -761,6 +780,7 @@ export default function Ball({
     setBuffLabel('');
     setBoundTierId(null);
     setReplaySaveMsg('');
+    setSavePromptOpen(false);
     setPhase('idle');
     syncScore(0);
     syncPp(0);
@@ -985,8 +1005,19 @@ export default function Ball({
       previewRef.current = null;
     }
     cancelAim();
-    setOver(true);
+    setOver(true, { save: false });
+    setSavePromptOpen(true);
   }, [cancelAim, setOver]);
+
+  const confirmSaveReplay = useCallback(() => {
+    setSavePromptOpen(false);
+    void saveReplay();
+  }, [saveReplay]);
+
+  const skipSaveReplay = useCallback(() => {
+    setSavePromptOpen(false);
+    setReplaySaveMsg('기록을 저장하지 않았습니다');
+  }, []);
 
   const lastReplayRef = useRef<ReplayData | null>(null);
   useEffect(() => {
@@ -1115,13 +1146,13 @@ export default function Ball({
         const multiplier = 1 + comboLevel * COMBO_MULT_STEP;
         const base = getTier(nextId).score;
         const gained = Math.round(base * multiplier);
-        syncScore(scoreRef.current + gained);
-        syncPp(ppRef.current + 1);
+        syncScoreRef.current(scoreRef.current + gained);
+        syncPpRef.current(ppRef.current + 1);
 
         if (comboLevel >= 1) {
           setCombo(comboLevel);
           setComboFlash((n) => n + 1);
-          clearComboUiSoon();
+          clearComboUiSoonRef.current();
         }
       }
     });
@@ -1159,7 +1190,7 @@ export default function Ball({
       });
 
       if (settledOverLine) {
-        setOver(true);
+        setOverRef.current(true);
         if (previewRef.current) {
           Composite.remove(engine.world, previewRef.current);
           previewRef.current = null;
@@ -1215,7 +1246,8 @@ export default function Ball({
       runnerRef.current = null;
       previewRef.current = null;
     };
-  }, [syncScore, syncPp, setOver, clearComboUiSoon]);
+    // Matter 월드는 마운트 시 한 번만 생성 (콜백 identity 변경으로 재생성되면 프리뷰 공이 사라짐)
+  }, []);
 
   const comboMultiplier =
     combo >= 1 ? (1 + combo * COMBO_MULT_STEP).toFixed(1) : null;
@@ -1523,35 +1555,73 @@ export default function Ball({
               </span>
             </div>
           ) : null}
+
+          {phase === 'gameover' ? (
+            <div
+              className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-2 bg-slate-950/75 px-6 backdrop-blur-[2px]"
+              onClick={(e) => e.stopPropagation()}
+              role="dialog"
+              aria-modal="true"
+              aria-label="게임 오버"
+            >
+              <p className="text-lg font-bold text-rose-200">게임 오버</p>
+              <p className="text-sm text-slate-200">
+                최종 점수 {score} · PP {pp}
+              </p>
+              {replaySaveMsg ? (
+                <p className="text-xs text-sky-300">{replaySaveMsg}</p>
+              ) : null}
+              <button
+                type="button"
+                className="mt-1 rounded-full bg-emerald-500 px-5 py-2 text-sm font-semibold text-slate-950 hover:bg-emerald-400"
+                onClick={goIdle}
+              >
+                다시 하기
+              </button>
+            </div>
+          ) : null}
           </div>
       </div>
 
-      {phase === 'gameover' ? (
-        <div className="flex flex-col items-center gap-2 rounded-lg border border-rose-400/40 bg-rose-950/40 px-4 py-3 text-center">
-          <p className="font-semibold text-rose-200">게임 오버</p>
+      {savePromptOpen ? (
+        <BasicModal
+          setOnModal={(open) => {
+            if (open) setSavePromptOpen(true);
+            else skipSaveReplay();
+          }}
+          dimClick={false}
+          className="max-w-xs gap-3 text-center"
+        >
+          <h2 className="text-base font-bold text-white">기록 저장</h2>
           <p className="text-sm text-slate-300">
-            최종 점수 {score} · PP {pp}
+            이번 플레이 기록을 저장할까요?
           </p>
-          {replaySaveMsg ? (
-            <p className="text-xs text-sky-300">{replaySaveMsg}</p>
-          ) : null}
-          <button
-            type="button"
-            className="rounded-full bg-emerald-500 px-4 py-1.5 text-sm font-semibold text-slate-950 hover:bg-emerald-400"
-            onClick={goIdle}
-          >
-            다시 하기
-          </button>
-        </div>
-      ) : phase === 'playing' ? (
-        <p className="text-center text-xs text-slate-400">
-          클릭으로 드롭 · 보드 왼쪽 기술 사용 · 합체 시 PP +1
-        </p>
-      ) : phase === 'replay' ? (
-        <p className="text-center text-xs text-amber-300">
-          기록 재생 중…
-        </p>
+          <div className="mt-1 flex justify-center gap-2">
+            <button
+              type="button"
+              className="rounded-full bg-emerald-500 px-5 py-1.5 text-sm font-semibold text-slate-950 hover:bg-emerald-400"
+              onClick={confirmSaveReplay}
+            >
+              예
+            </button>
+            <button
+              type="button"
+              className="rounded-full border border-slate-500 bg-slate-900 px-5 py-1.5 text-sm font-semibold text-slate-100 hover:border-slate-300"
+              onClick={skipSaveReplay}
+            >
+              아니오
+            </button>
+          </div>
+        </BasicModal>
       ) : null}
+
+      <p className="min-h-5 text-center text-xs text-slate-400">
+        {phase === 'playing'
+          ? '클릭으로 드롭 · 보드 왼쪽 기술 사용 · 합체 시 PP +1'
+          : phase === 'replay'
+            ? '기록 재생 중…'
+            : '\u00a0'}
+      </p>
 
       <div className="flex flex-wrap justify-center gap-1.5 opacity-90">
         {BALL_TIERS.map((tier) => (

@@ -36,5 +36,6 @@ export type ReplayListItem = {
   max_grade: number | null;
   duration_sec: number | null;
   created_at: string;
-  guest_id: string | null;
+  user_id?: string | null;
+  guest_id?: string | null;
 };

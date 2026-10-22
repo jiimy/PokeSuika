@@ -19,42 +19,59 @@ function isReplayData(value: unknown): value is ReplayData {
 }
 
 /**
+ * game_replays.user_id → auth.users FK 를 통과시키기 위해
+ * 게스트 UUID 가 없으면 auth 유저를 만든다.
+ */
+async function ensureAuthUserForGuest(
+  supabase: ReturnType<typeof createAdminClient>,
+  userId: string,
+  guestId: string | null,
+) {
+  const existing = await supabase.auth.admin.getUserById(userId);
+  if (existing.data.user) return;
+
+  const emailLocal = userId.replace(/-/g, '').slice(0, 16);
+  const { error } = await supabase.auth.admin.createUser({
+    id: userId,
+    email: `guest_${emailLocal}@pokesuika.local`,
+    email_confirm: true,
+    user_metadata: {
+      guest: true,
+      guestId: guestId ?? undefined,
+    },
+  });
+
+  if (error && !/already|registered|exists/i.test(error.message)) {
+    throw new Error(error.message);
+  }
+}
+
+/**
  * GET /api/game-replays?userId=<uuid>
  * 게스트·로그인 모두 user_id 로 조회
  */
 export async function GET(request: NextRequest) {
   try {
     const userId = request.nextUrl.searchParams.get('userId');
-    const guestId = request.nextUrl.searchParams.get('guestId');
 
-    if (!userId && !guestId) {
+    if (!userId) {
       return Response.json(
-        { ok: false, error: 'userId or guestId required' },
+        { ok: false, error: 'userId required' },
         { status: 400 },
       );
     }
-    if (userId && !UUID_PATTERN.test(userId)) {
+    if (!UUID_PATTERN.test(userId)) {
       return Response.json({ ok: false, error: 'invalid userId' }, { status: 400 });
-    }
-    if (guestId && !GUEST_PATTERN.test(guestId)) {
-      return Response.json({ ok: false, error: 'invalid guestId' }, { status: 400 });
     }
 
     const supabase = createAdminClient();
-    let query = supabase
+    const { data, error } = await supabase
       .from('game_replays')
-      .select('id, score, max_grade, duration_sec, created_at, guest_id, user_id')
+      .select('id, score, max_grade, duration_sec, created_at, user_id')
+      .eq('user_id', userId)
       .order('created_at', { ascending: false })
       .limit(50);
 
-    // 게스트여도 user_id 우선 조회
-    if (userId) {
-      query = query.eq('user_id', userId);
-    } else if (guestId) {
-      query = query.eq('guest_id', guestId);
-    }
-
-    const { data, error } = await query;
     if (error) {
       console.error('[GET /api/game-replays]', error);
       return Response.json(
@@ -77,7 +94,7 @@ export async function GET(request: NextRequest) {
 
 /**
  * POST /api/game-replays
- * 게스트도 user_id(UUID)에 저장. guest_id 는 표시용.
+ * 게스트도 user_id(UUID)에 저장. 필요 시 auth.users 에 게스트 계정 생성.
  */
 export async function POST(request: NextRequest) {
   try {
@@ -112,11 +129,12 @@ export async function POST(request: NextRequest) {
     }
 
     const supabase = createAdminClient();
+    await ensureAuthUserForGuest(supabase, userId, guestId);
+
     const { data, error } = await supabase
       .from('game_replays')
       .insert({
         user_id: userId,
-        guest_id: guestId,
         score: Math.floor(score),
         max_grade: Math.floor(maxGrade),
         duration_sec: Math.max(0, Math.floor(durationSec)),

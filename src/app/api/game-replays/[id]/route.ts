@@ -19,7 +19,7 @@ export async function GET(_request: NextRequest, context: RouteContext) {
     const { data, error } = await supabase
       .from('game_replays')
       .select(
-        'id, score, max_grade, duration_sec, created_at, guest_id, user_id, replay_data',
+        'id, score, max_grade, duration_sec, created_at, user_id, replay_data',
       )
       .eq('id', id)
       .maybeSingle();

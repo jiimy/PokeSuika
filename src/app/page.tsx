@@ -1,6 +1,11 @@
 'use client';
 
-import { Suspense, useState } from 'react';
+import {
+  Suspense,
+  useCallback,
+  useState,
+  useSyncExternalStore,
+} from 'react';
 
 import Ball from '@/components/ball/Ball';
 import BasicModal from '@/components/portalModal/basicModal/BasicModal';
@@ -10,18 +15,36 @@ import {
   readStoredGuestId,
 } from '@/utils/guestId';
 
+const emptySubscribe = () => () => {};
+
 export default function Home() {
-  const [guestId, setGuestId] = useState<string | null>(() => readStoredGuestId());
-  const [hasReplays, setHasReplays] = useState(false);
+  // 서버 스냅샷은 항상 null → 하이드레이션 일치
+  const storedGuestId = useSyncExternalStore(
+    emptySubscribe,
+    readStoredGuestId,
+    () => null,
+  );
+  const [guestIdOverride, setGuestIdOverride] = useState<string | null>(null);
+  const guestId = guestIdOverride ?? storedGuestId;
+
   const [replayModal, setReplayModal] = useState(false);
   const [replayItems, setReplayItems] = useState<ReplayListItem[]>([]);
   const [replayLoading, setReplayLoading] = useState(false);
   const [replayError, setReplayError] = useState('');
   const [replayToPlay, setReplayToPlay] = useState<ReplayData | null>(null);
 
+  const handleReplaySaved = useCallback(() => {
+    const { guestId: displayId } = getOrCreateGuestIdentity();
+    setGuestIdOverride(displayId);
+  }, []);
+
+  const handleReplayFinished = useCallback(() => {
+    setReplayToPlay(null);
+  }, []);
+
   const openReplayModal = async () => {
     const { guestId: displayId, userId } = getOrCreateGuestIdentity();
-    setGuestId(displayId);
+    setGuestIdOverride(displayId);
     setReplayModal(true);
     setReplayLoading(true);
     setReplayError('');
@@ -39,9 +62,7 @@ export default function Home() {
         setReplayItems([]);
         return;
       }
-      const items = json.items ?? [];
-      setReplayItems(items);
-      setHasReplays(items.length > 0);
+      setReplayItems(json.items ?? []);
     } catch (error) {
       setReplayError(
         error instanceof Error ? error.message : '목록을 불러오지 못했습니다',
@@ -99,15 +120,13 @@ export default function Home() {
         </div>
 
         <div className="absolute top-1/2 right-0 flex -translate-y-1/2 items-center gap-2">
-          {guestId || hasReplays ? (
-            <button
-              type="button"
-              className="rounded-full border border-amber-500/60 bg-amber-500/15 px-3 py-1.5 text-sm font-semibold text-amber-200 hover:bg-amber-500/25"
-              onClick={() => void openReplayModal()}
-            >
-              기록보기
-            </button>
-          ) : null}
+          <button
+            type="button"
+            className="rounded-full border border-amber-500/60 bg-amber-500/15 px-3 py-1.5 text-sm font-semibold text-amber-200 hover:bg-amber-500/25"
+            onClick={() => void openReplayModal()}
+          >
+            기록보기
+          </button>
 
           {guestId ? (
             <div className="rounded-full border border-slate-600 bg-slate-900/80 px-3 py-1.5 text-right">
@@ -139,14 +158,10 @@ export default function Home() {
         }
       >
         <Ball
-          onGuestSession={setGuestId}
-          onReplaySaved={() => {
-            const { guestId: displayId } = getOrCreateGuestIdentity();
-            setGuestId(displayId);
-            setHasReplays(true);
-          }}
+          onGuestSession={setGuestIdOverride}
+          onReplaySaved={handleReplaySaved}
           replayToPlay={replayToPlay}
-          onReplayFinished={() => setReplayToPlay(null)}
+          onReplayFinished={handleReplayFinished}
         />
       </Suspense>
 
