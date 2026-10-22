@@ -1,8 +1,7 @@
-import { ChildrenModalType } from '@/types/modal';
-import classNames from 'classnames';
-import ModalFrame from '../ModalFrame';
-import s from './comfirmModal.module.scss';
+import type { ChildrenModalType } from '@/types/modal';
+
 import { Modal } from '../Modal';
+import ModalFrame from '../ModalFrame';
 
 type modal = {
   title: string;
@@ -20,21 +19,20 @@ const ConfirmModal = ({
   onConfirm,
   onCancel,
 }: ChildrenModalType & modal) => {
-
   return (
     <ModalFrame
       setOnModal={setOnModal}
       isDim={isDim}
       onClose
       dimClick={dimClick}
-      zindex={40}
-      className={classNames([s.confirm_modal], className)}
+      className={className}
     >
       <Modal.Title>{title}</Modal.Title>
-      {children && <Modal.Content>{children}</Modal.Content>}
-      <div className="flex gap-3 mt-6">
+      {children ? <Modal.Content>{children}</Modal.Content> : null}
+      <div className="mt-6 flex gap-3">
         <button
           type="button"
+          className="rounded-full bg-emerald-500 px-4 py-1.5 text-sm font-semibold text-slate-950 hover:bg-emerald-400"
           onClick={async () => {
             try {
               await onConfirm?.();
@@ -47,6 +45,7 @@ const ConfirmModal = ({
         </button>
         <button
           type="button"
+          className="rounded-full border border-slate-500 bg-slate-900 px-4 py-1.5 text-sm font-semibold text-slate-100 hover:border-slate-300"
           onClick={async () => {
             try {
               await onCancel?.();
