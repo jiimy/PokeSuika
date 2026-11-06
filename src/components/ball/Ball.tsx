@@ -36,9 +36,34 @@ const TRICK_ROOM_TURNS = 10;
 const MIMIC_TURNS = 3;
 const BIND_TURNS = 3;
 const SKILL_PANEL_WIDTH = 200;
+const PLAYBACK_RATES = [0.5, 1, 1.5, 2] as const;
+const PLAYBACK_SIM_STEP_MS = 1000 / 60;
+type PlaybackRate = (typeof PLAYBACK_RATES)[number];
 
 type GamePhase = 'idle' | 'selecting' | 'playing' | 'gameover' | 'replay';
 type AimMode = null | 'shrink' | 'trick' | 'blowAway';
+
+function formatPlaybackTime(ms: number) {
+  const totalSec = Math.max(0, Math.floor(ms / 1000));
+  const min = Math.floor(totalSec / 60);
+  const sec = totalSec % 60;
+  return `${min}:${String(sec).padStart(2, '0')}`;
+}
+
+/** 시크 시 액션 사이 물리 시간을 빠르게 재생해 공 위치를 맞춤 */
+function advancePlaybackPhysics(engine: Matter.Engine, ms: number) {
+  if (ms <= 0) return;
+  let step = PLAYBACK_SIM_STEP_MS;
+  if (ms > 8000) step = PLAYBACK_SIM_STEP_MS * 2;
+  if (ms > 25000) step = PLAYBACK_SIM_STEP_MS * 4;
+
+  let left = ms;
+  while (left > 0) {
+    const dt = Math.min(step, left);
+    Engine.update(engine, dt);
+    left -= dt;
+  }
+}
 
 type BallBody = Matter.Body & {
   plugin: {
@@ -153,13 +178,26 @@ export default function Ball({
   const savingReplayRef = useRef(false);
   const isPlaybackRef = useRef(false);
   const playbackRafRef = useRef<number | null>(null);
+  const playbackPausedRef = useRef(false);
+  const playbackRateRef = useRef<PlaybackRate>(1);
+  const playbackDataRef = useRef<ReplayData | null>(null);
+  const playbackFinishTimerRef = useRef<number | null>(null);
+  const playbackDropTokenRef = useRef(0);
+  const playbackUiStampRef = useRef(0);
+  const seekDebounceRef = useRef<number | null>(null);
+  const pendingSeekMsRef = useRef<number | null>(null);
   const playbackRef = useRef<{
     actions: ReplayAction[];
     index: number;
     startedAt: number;
+    elapsed: number;
   } | null>(null);
 
   const [phase, setPhase] = useState<GamePhase>('idle');
+  const [playbackPaused, setPlaybackPaused] = useState(false);
+  const [playbackRate, setPlaybackRateState] = useState<PlaybackRate>(1);
+  const [playbackElapsedMs, setPlaybackElapsedMs] = useState(0);
+  const [playbackDurationMs, setPlaybackDurationMs] = useState(1);
   const [pickedSkills, setPickedSkills] = useState<SkillId[]>([]);
   const [equipped, setEquipped] = useState<SkillId[]>([]);
   const [score, setScore] = useState(0);
@@ -385,7 +423,12 @@ export default function Ball({
   }, [syncScore, syncPp, setOver, clearComboUiSoon]);
 
   const dropBallAt = useCallback(
-    (dropX: number, tierId: number, record: boolean) => {
+    (
+      dropX: number,
+      tierId: number,
+      record: boolean,
+      options?: { immediatePreview?: boolean },
+    ) => {
       const engine = engineRef.current;
       if (!engine || gameOverRef.current || !playingRef.current) return;
 
@@ -409,9 +452,22 @@ export default function Ball({
       setCurrentTierId(currentTierRef.current);
       setNextTierId(nextTierRef.current);
 
-      window.setTimeout(() => {
+      const finishDrop = () => {
         droppingRef.current = false;
         if (!gameOverRef.current && playingRef.current) spawnPreview();
+      };
+
+      if (options?.immediatePreview) {
+        finishDrop();
+        return;
+      }
+
+      const token = ++playbackDropTokenRef.current;
+      window.setTimeout(() => {
+        if (isPlaybackRef.current && token !== playbackDropTokenRef.current) {
+          return;
+        }
+        finishDrop();
       }, isPlaybackRef.current ? 120 : DROP_COOLDOWN_MS);
     },
     [clampDropX, spawnPreview, nextDropTier],
@@ -698,7 +754,7 @@ export default function Ball({
   );
 
   const beginPlay = useCallback(() => {
-    if (pickedSkills.length !== SKILL_PICK_COUNT) return;
+    if (pickedSkills.length > SKILL_PICK_COUNT) return;
 
     clearFieldBalls();
     mergeLockRef.current.clear();
@@ -753,16 +809,41 @@ export default function Ball({
     onGuestSession,
   ]);
 
+  const clearPlaybackFinishTimer = useCallback(() => {
+    if (playbackFinishTimerRef.current != null) {
+      window.clearTimeout(playbackFinishTimerRef.current);
+      playbackFinishTimerRef.current = null;
+    }
+  }, []);
+
   const stopPlaybackLoop = useCallback(() => {
     if (playbackRafRef.current != null) {
       cancelAnimationFrame(playbackRafRef.current);
       playbackRafRef.current = null;
     }
+    clearPlaybackFinishTimer();
+    if (seekDebounceRef.current != null) {
+      window.clearTimeout(seekDebounceRef.current);
+      seekDebounceRef.current = null;
+    }
+    pendingSeekMsRef.current = null;
     playbackRef.current = null;
+    playbackDataRef.current = null;
     isPlaybackRef.current = false;
-  }, []);
+    playbackPausedRef.current = false;
+    playbackDropTokenRef.current += 1;
+    setPlaybackPaused(false);
+    setPlaybackElapsedMs(0);
+    setPlaybackDurationMs(1);
+    const runner = runnerRef.current;
+    const engine = engineRef.current;
+    if (runner && engine) {
+      Runner.run(runner, engine);
+    }
+  }, [clearPlaybackFinishTimer]);
 
   const goIdle = useCallback(() => {
+    const wasPlayback = isPlaybackRef.current || phase === 'replay';
     playingRef.current = false;
     gameOverRef.current = false;
     quakeSafeRef.current = false;
@@ -785,13 +866,16 @@ export default function Ball({
     syncScore(0);
     syncPp(0);
     onGameOverChange?.(false);
+    if (wasPlayback) onReplayFinished?.();
   }, [
+    phase,
     clearFieldBalls,
     cancelAim,
     syncScore,
     syncPp,
     onGameOverChange,
     stopPlaybackLoop,
+    onReplayFinished,
   ]);
 
   const findBallNear = useCallback((x: number, y: number) => {
@@ -811,7 +895,7 @@ export default function Ball({
   }, []);
 
   const applyPlaybackAction = useCallback(
-    (action: ReplayAction) => {
+    (action: ReplayAction, options?: { immediatePreview?: boolean }) => {
       const engine = engineRef.current;
       if (!engine || !playingRef.current) return;
 
@@ -830,7 +914,9 @@ export default function Ball({
       if (action.type === 'DROP') {
         currentTierRef.current = action.pokemonType;
         setCurrentTierId(action.pokemonType);
-        dropBallAt(action.x, action.pokemonType, false);
+        dropBallAt(action.x, action.pokemonType, false, {
+          immediatePreview: options?.immediatePreview,
+        });
         return;
       }
 
@@ -913,9 +999,71 @@ export default function Ball({
     [clampDropX, dropBallAt, findBallNear, spawnPreview, refreshBuffLabel],
   );
 
-  const startPlayback = useCallback(
+  const readPlaybackElapsed = useCallback(() => {
+    const pb = playbackRef.current;
+    if (!pb) return 0;
+    if (playbackPausedRef.current) return pb.elapsed;
+    const rate = playbackRateRef.current || 1;
+    return Math.max(0, (performance.now() - pb.startedAt) * rate);
+  }, []);
+
+  const syncPlaybackClock = useCallback((elapsed: number) => {
+    const pb = playbackRef.current;
+    if (!pb) return;
+    const rate = playbackRateRef.current || 1;
+    pb.elapsed = Math.max(0, elapsed);
+    pb.startedAt = performance.now() - pb.elapsed / rate;
+  }, []);
+
+  const finishPlayback = useCallback(() => {
+    clearPlaybackFinishTimer();
+    playbackFinishTimerRef.current = window.setTimeout(() => {
+      if (!isPlaybackRef.current) return;
+      playingRef.current = false;
+      isPlaybackRef.current = false;
+      playbackPausedRef.current = false;
+      playbackRef.current = null;
+      playbackDataRef.current = null;
+      setPlaybackPaused(false);
+      setPhase('idle');
+      onReplayFinished?.();
+    }, 800);
+  }, [clearPlaybackFinishTimer, onReplayFinished]);
+
+  const runPlaybackTick = useCallback(() => {
+    const tick = () => {
+      const pb = playbackRef.current;
+      if (!pb || !isPlaybackRef.current || playbackPausedRef.current) return;
+
+      const elapsed = readPlaybackElapsed();
+      pb.elapsed = elapsed;
+      while (pb.index < pb.actions.length) {
+        const action = pb.actions[pb.index];
+        if (!action || action.time > elapsed) break;
+        pb.index += 1;
+        applyPlaybackAction(action);
+      }
+
+      const now = performance.now();
+      if (now - playbackUiStampRef.current > 80) {
+        playbackUiStampRef.current = now;
+        setPlaybackElapsedMs(elapsed);
+      }
+
+      if (pb.index >= pb.actions.length) {
+        setPlaybackElapsedMs(elapsed);
+        finishPlayback();
+        return;
+      }
+      playbackRafRef.current = requestAnimationFrame(tick);
+    };
+    playbackRafRef.current = requestAnimationFrame(tick);
+  }, [applyPlaybackAction, finishPlayback, readPlaybackElapsed]);
+
+  const resetPlaybackScene = useCallback(
     (data: ReplayData) => {
-      stopPlaybackLoop();
+      clearPlaybackFinishTimer();
+      playbackDropTokenRef.current += 1;
       clearFieldBalls();
       mergeLockRef.current.clear();
       mergeStreakRef.current = 0;
@@ -933,6 +1081,7 @@ export default function Ball({
       syncScore(0);
       syncPp(0);
       gameOverRef.current = false;
+      droppingRef.current = false;
       recorderRef.current.reset();
 
       rngRef.current = createSeededRandom(data.seed);
@@ -947,54 +1096,178 @@ export default function Ball({
       nextTierRef.current = randomDropTierId({ random: rngRef.current });
       setCurrentTierId(currentTierRef.current);
       setNextTierId(nextTierRef.current);
-
-      isPlaybackRef.current = true;
-      playingRef.current = true;
-      setPhase('replay');
-      droppingRef.current = false;
       spawnPreview();
-
-      playbackRef.current = {
-        actions: data.actions,
-        index: 0,
-        startedAt: performance.now(),
-      };
-
-      const tick = () => {
-        const pb = playbackRef.current;
-        if (!pb || !isPlaybackRef.current) return;
-        const elapsed = performance.now() - pb.startedAt;
-        while (pb.index < pb.actions.length) {
-          const action = pb.actions[pb.index];
-          if (!action || action.time > elapsed) break;
-          pb.index += 1;
-          applyPlaybackAction(action);
-        }
-        if (pb.index >= pb.actions.length) {
-          window.setTimeout(() => {
-            if (!isPlaybackRef.current) return;
-            playingRef.current = false;
-            isPlaybackRef.current = false;
-            playbackRef.current = null;
-            setPhase('idle');
-            onReplayFinished?.();
-          }, 800);
-          return;
-        }
-        playbackRafRef.current = requestAnimationFrame(tick);
-      };
-      playbackRafRef.current = requestAnimationFrame(tick);
     },
     [
-      stopPlaybackLoop,
+      clearPlaybackFinishTimer,
       clearFieldBalls,
       cancelAim,
       syncScore,
       syncPp,
       spawnPreview,
-      applyPlaybackAction,
-      onReplayFinished,
     ],
+  );
+
+  const seekPlaybackToTime = useCallback(
+    (timeMs: number) => {
+      const data = playbackDataRef.current;
+      const pb = playbackRef.current;
+      const engine = engineRef.current;
+      if (!data || !pb || !engine || !isPlaybackRef.current) return;
+
+      const duration =
+        pb.actions.length > 0
+          ? Math.max(1, pb.actions[pb.actions.length - 1]?.time ?? 1)
+          : 1;
+      const t = Math.max(0, Math.min(timeMs, duration));
+
+      const runner = runnerRef.current;
+      if (runner) Runner.stop(runner);
+      if (playbackRafRef.current != null) {
+        cancelAnimationFrame(playbackRafRef.current);
+        playbackRafRef.current = null;
+      }
+      clearPlaybackFinishTimer();
+
+      // 시크 중에는 항상 일시정지 — 물리만 수동으로 맞춤
+      playbackPausedRef.current = true;
+      setPlaybackPaused(true);
+
+      resetPlaybackScene(data);
+
+      let cursor = 0;
+      let targetIndex = 0;
+      while (
+        targetIndex < pb.actions.length &&
+        (pb.actions[targetIndex]?.time ?? 0) <= t
+      ) {
+        const action = pb.actions[targetIndex];
+        if (!action) break;
+        const gap = Math.max(0, action.time - cursor);
+        if (gap > 0) advancePlaybackPhysics(engine, gap);
+        applyPlaybackAction(action, { immediatePreview: true });
+        cursor = action.time;
+        targetIndex += 1;
+      }
+
+      const tail = Math.max(0, t - cursor);
+      if (tail > 0) advancePlaybackPhysics(engine, tail);
+
+      pb.index = targetIndex;
+      syncPlaybackClock(t);
+      setPlaybackElapsedMs(t);
+    },
+    [
+      resetPlaybackScene,
+      applyPlaybackAction,
+      syncPlaybackClock,
+      clearPlaybackFinishTimer,
+    ],
+  );
+
+  const queueSeekToTime = useCallback(
+    (timeMs: number) => {
+      setPlaybackElapsedMs(timeMs);
+      pendingSeekMsRef.current = timeMs;
+      if (seekDebounceRef.current != null) return;
+      seekDebounceRef.current = window.setTimeout(() => {
+        seekDebounceRef.current = null;
+        const pending = pendingSeekMsRef.current;
+        if (pending != null) seekPlaybackToTime(pending);
+      }, 40);
+    },
+    [seekPlaybackToTime],
+  );
+
+  const pausePlayback = useCallback(() => {
+    const pb = playbackRef.current;
+    if (!pb || !isPlaybackRef.current || playbackPausedRef.current) return;
+
+    playbackPausedRef.current = true;
+    setPlaybackPaused(true);
+    pb.elapsed = readPlaybackElapsed();
+    setPlaybackElapsedMs(pb.elapsed);
+    if (playbackRafRef.current != null) {
+      cancelAnimationFrame(playbackRafRef.current);
+      playbackRafRef.current = null;
+    }
+    clearPlaybackFinishTimer();
+    const runner = runnerRef.current;
+    if (runner) Runner.stop(runner);
+  }, [clearPlaybackFinishTimer, readPlaybackElapsed]);
+
+  const resumePlayback = useCallback(() => {
+    const pb = playbackRef.current;
+    if (!pb || !isPlaybackRef.current || !playbackPausedRef.current) return;
+
+    playbackPausedRef.current = false;
+    setPlaybackPaused(false);
+    syncPlaybackClock(pb.elapsed);
+    const runner = runnerRef.current;
+    const engine = engineRef.current;
+    if (runner && engine) Runner.run(runner, engine);
+
+    if (pb.index >= pb.actions.length) {
+      finishPlayback();
+      return;
+    }
+    runPlaybackTick();
+  }, [finishPlayback, runPlaybackTick, syncPlaybackClock]);
+
+  const togglePlaybackPause = useCallback(() => {
+    if (playbackPausedRef.current) resumePlayback();
+    else pausePlayback();
+  }, [pausePlayback, resumePlayback]);
+
+  const changePlaybackRate = useCallback(
+    (rate: PlaybackRate) => {
+      const pb = playbackRef.current;
+      if (pb && isPlaybackRef.current) {
+        const elapsed = readPlaybackElapsed();
+        playbackRateRef.current = rate;
+        syncPlaybackClock(elapsed);
+        setPlaybackElapsedMs(elapsed);
+      } else {
+        playbackRateRef.current = rate;
+      }
+      setPlaybackRateState(rate);
+    },
+    [readPlaybackElapsed, syncPlaybackClock],
+  );
+
+  const startPlayback = useCallback(
+    (data: ReplayData) => {
+      stopPlaybackLoop();
+      playbackDataRef.current = data;
+      resetPlaybackScene(data);
+
+      const duration =
+        data.actions.length > 0
+          ? Math.max(1, data.actions[data.actions.length - 1]?.time ?? 1)
+          : 1;
+
+      isPlaybackRef.current = true;
+      playbackPausedRef.current = false;
+      playingRef.current = true;
+      setPlaybackPaused(false);
+      setPlaybackDurationMs(duration);
+      setPlaybackElapsedMs(0);
+      setPhase('replay');
+
+      playbackRef.current = {
+        actions: data.actions,
+        index: 0,
+        startedAt: performance.now(),
+        elapsed: 0,
+      };
+      syncPlaybackClock(0);
+
+      const runner = runnerRef.current;
+      const engine = engineRef.current;
+      if (runner && engine) Runner.run(runner, engine);
+      runPlaybackTick();
+    },
+    [stopPlaybackLoop, resetPlaybackScene, runPlaybackTick, syncPlaybackClock],
   );
 
   const quickEnd = useCallback(() => {
@@ -1161,6 +1434,8 @@ export default function Ball({
       if (!playingRef.current || gameOverRef.current || droppingRef.current) {
         return;
       }
+      // 리플레이는 타임라인으로만 종료 (시크 시 컷라인 게임오버로 idle 되는 것 방지)
+      if (isPlaybackRef.current) return;
 
       const balls = engine.world.bodies.filter(
         (body) => isFieldBall(body) && !body.plugin.merging,
@@ -1254,8 +1529,7 @@ export default function Ball({
   const showHud =
     phase === 'playing' || phase === 'gameover' || phase === 'replay';
 
-  const showSkills =
-    (phase === 'playing' || phase === 'replay') && equipped.length > 0;
+  const showSidePanel = phase === 'playing' || phase === 'replay';
 
   return (
     <div className="flex w-full flex-col items-center gap-3">
@@ -1263,7 +1537,7 @@ export default function Ball({
         className="relative flex flex-col gap-2"
         style={{ width: BOARD_WIDTH }}
       >
-        {showSkills ? (
+        {showSidePanel ? (
           <aside
             className="absolute bottom-0 flex flex-col gap-1.5"
             style={{
@@ -1290,42 +1564,44 @@ export default function Ball({
               </div>
             ) : (
               <p className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-center text-[10px] text-amber-200">
-                재생 중
+                {playbackPaused ? '일시정지' : '재생 중'} · {playbackRate}x
               </p>
             )}
-            <div className="grid grid-cols-2 gap-1.5">
-              {equipped.map((id) => {
-                const skill = getSkill(id);
-                const canAfford = pp >= skill.cost && phase === 'playing';
-                const active = aimMode === id;
-                return (
-                  <button
-                    key={id}
-                    type="button"
-                    disabled={phase !== 'playing'}
-                    title={`${skill.description} (PP ${skill.cost})`}
-                    onClick={() => activateSkill(id)}
-                    className={`flex min-h-[72px] flex-col rounded-md border px-1.5 py-1.5 text-left leading-tight transition disabled:cursor-default ${
-                      active
-                        ? 'border-amber-300 bg-amber-400/90 text-slate-950'
-                        : canAfford
-                          ? 'border-slate-500 bg-slate-900 text-slate-100 hover:border-sky-300'
-                          : 'border-slate-700 bg-slate-950 text-slate-500'
-                    }`}
-                  >
-                    <div className="text-[11px] font-bold">{skill.name}</div>
-                    <div className="text-[9px] opacity-80">PP {skill.cost}</div>
-                    <p
-                      className={`mt-auto pt-1 text-[9px] leading-snug ${
-                        active ? 'text-slate-800' : 'text-slate-400'
+            {equipped.length > 0 ? (
+              <div className="grid grid-cols-2 gap-1.5">
+                {equipped.map((id) => {
+                  const skill = getSkill(id);
+                  const canAfford = pp >= skill.cost && phase === 'playing';
+                  const active = aimMode === id;
+                  return (
+                    <button
+                      key={id}
+                      type="button"
+                      disabled={phase !== 'playing'}
+                      title={`${skill.description} (PP ${skill.cost})`}
+                      onClick={() => activateSkill(id)}
+                      className={`flex min-h-[72px] flex-col rounded-md border px-1.5 py-1.5 text-left leading-tight transition disabled:cursor-default ${
+                        active
+                          ? 'border-amber-300 bg-amber-400/90 text-slate-950'
+                          : canAfford
+                            ? 'border-slate-500 bg-slate-900 text-slate-100 hover:border-sky-300'
+                            : 'border-slate-700 bg-slate-950 text-slate-500'
                       }`}
                     >
-                      {skill.description}
-                    </p>
-                  </button>
-                );
-              })}
-            </div>
+                      <div className="text-[11px] font-bold">{skill.name}</div>
+                      <div className="text-[9px] opacity-80">PP {skill.cost}</div>
+                      <p
+                        className={`mt-auto pt-1 text-[9px] leading-snug ${
+                          active ? 'text-slate-800' : 'text-slate-400'
+                        }`}
+                      >
+                        {skill.description}
+                      </p>
+                    </button>
+                  );
+                })}
+              </div>
+            ) : null}
           </aside>
         ) : null}
           {showHud ? (
@@ -1392,9 +1668,6 @@ export default function Ball({
           >
           {phase === 'idle' ? (
             <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-3 bg-slate-950/70 px-6">
-              <p className="text-center text-sm text-slate-300">
-                기술을 고른 뒤 게임을 시작하세요
-              </p>
               <button
                 type="button"
                 className="rounded-full bg-emerald-500 px-6 py-2.5 text-base font-bold text-slate-950 hover:bg-emerald-400"
@@ -1415,7 +1688,7 @@ export default function Ball({
               onClick={(e) => e.stopPropagation()}
             >
               <p className="text-center text-sm font-semibold text-white">
-                기술 {SKILL_PICK_COUNT}개 선택 ({pickedSkills.length}/
+                기술 선택 최대 4개 ({pickedSkills.length}/
                 {SKILL_PICK_COUNT})
               </p>
               <ul className="flex flex-col gap-1.5">
@@ -1461,8 +1734,7 @@ export default function Ball({
                 </button>
                 <button
                   type="button"
-                  disabled={pickedSkills.length !== SKILL_PICK_COUNT}
-                  className="flex-1 rounded-full bg-emerald-500 px-3 py-2 text-sm font-semibold text-slate-950 hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-40"
+                  className="flex-1 rounded-full bg-emerald-500 px-3 py-2 text-sm font-semibold text-slate-950 hover:bg-emerald-400"
                   onClick={beginPlay}
                 >
                   시작
@@ -1615,13 +1887,87 @@ export default function Ball({
         </BasicModal>
       ) : null}
 
-      <p className="min-h-5 text-center text-xs text-slate-400">
-        {phase === 'playing'
-          ? '클릭으로 드롭 · 보드 왼쪽 기술 사용 · 합체 시 PP +1'
-          : phase === 'replay'
-            ? '기록 재생 중…'
+      {phase === 'replay' ? (
+        <div
+          className="flex flex-col gap-2 rounded-xl border border-slate-700 bg-slate-900/80 px-3 py-2.5"
+          style={{ width: BOARD_WIDTH }}
+          onClick={(e) => e.stopPropagation()}
+          onPointerDown={(e) => e.stopPropagation()}
+        >
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              title={playbackPaused ? '재생' : '일시정지'}
+              className="shrink-0 rounded-md border border-amber-400/70 bg-amber-500/20 px-2.5 py-1.5 text-xs font-semibold text-amber-100 hover:bg-amber-500/30"
+              onClick={(e) => {
+                e.stopPropagation();
+                togglePlaybackPause();
+              }}
+            >
+              {playbackPaused ? '▶' : '❚❚'}
+            </button>
+            <input
+              type="range"
+              min={0}
+              max={playbackDurationMs}
+              step={1}
+              value={Math.min(playbackElapsedMs, playbackDurationMs)}
+              aria-label="재생 위치"
+              className="h-2 flex-1 cursor-pointer accent-amber-400"
+              onPointerDown={(e) => {
+                e.stopPropagation();
+                if (!playbackPausedRef.current) pausePlayback();
+              }}
+              onClick={(e) => e.stopPropagation()}
+              onChange={(e) => {
+                e.stopPropagation();
+                queueSeekToTime(Number(e.target.value));
+              }}
+            />
+            <span className="shrink-0 tabular-nums text-[11px] text-slate-300">
+              {formatPlaybackTime(playbackElapsedMs)} /{' '}
+              {formatPlaybackTime(playbackDurationMs)}
+            </span>
+          </div>
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex flex-wrap gap-1">
+              {PLAYBACK_RATES.map((rate) => (
+                <button
+                  key={rate}
+                  type="button"
+                  className={`rounded-md border px-2 py-1 text-[11px] font-semibold ${
+                    playbackRate === rate
+                      ? 'border-amber-400 bg-amber-500/25 text-amber-100'
+                      : 'border-slate-600 bg-slate-950 text-slate-300 hover:border-slate-400'
+                  }`}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    changePlaybackRate(rate);
+                  }}
+                >
+                  {rate}x
+                </button>
+              ))}
+            </div>
+            <button
+              type="button"
+              className="rounded-md border border-slate-500 bg-slate-900 px-2.5 py-1 text-[11px] font-semibold text-slate-100 hover:border-rose-400 hover:text-rose-200"
+              onClick={(e) => {
+                e.stopPropagation();
+                goIdle();
+              }}
+            >
+              재생 종료
+            </button>
+          </div>
+        </div>
+      ) : (
+        <p className="min-h-5 text-center text-xs text-slate-400">
+          {phase === 'playing'
+            ? '클릭으로 드롭 · 보드 왼쪽 기술 사용 · 합체 시 PP +1'
             : '\u00a0'}
-      </p>
+        </p>
+      )}
 
       <div className="flex flex-wrap justify-center gap-1.5 opacity-90">
         {BALL_TIERS.map((tier) => (

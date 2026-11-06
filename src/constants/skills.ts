@@ -14,6 +14,7 @@ export type SkillDef = {
   cost: number;
 };
 
+/** 기술 선택 최대 개수 (0~SKILL_PICK_COUNT) */
 export const SKILL_PICK_COUNT = 4;
 
 export const SKILLS: SkillDef[] = [
