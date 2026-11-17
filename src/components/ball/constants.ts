@@ -1,0 +1,13 @@
+export const BOARD_WIDTH = 400;
+export const BOARD_HEIGHT = 560;
+export const WALL_THICKNESS = 40;
+export const DROP_Y = 56;
+export const DROP_COOLDOWN_MS = 450;
+export const GAME_OVER_LINE_Y = 110;
+export const COMBO_MULT_STEP = 0.1;
+export const TRICK_ROOM_TURNS = 10;
+export const MIMIC_TURNS = 3;
+export const BIND_TURNS = 3;
+export const SKILL_PANEL_WIDTH = 200;
+export const PLAYBACK_RATES = [0.5, 1, 1.5, 2] as const;
+export const PLAYBACK_SIM_STEP_MS = 1000 / 60;

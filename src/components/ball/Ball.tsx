@@ -4,7 +4,6 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import Matter from 'matter-js';
 
 import {
-  BALL_TIERS,
   DROP_TIER_MAX,
   getTier,
   MAX_TIER_ID,
@@ -16,135 +15,56 @@ import {
   SKILLS,
   type SkillId,
 } from '@/constants/skills';
-import BasicModal from '@/components/portalModal/basicModal/BasicModal';
 import type { ReplayAction, ReplayData } from '@/types/replay';
 import { getOrCreateGuestIdentity } from '@/utils/guestId';
 import { ReplayRecorder } from '@/utils/replayRecorder';
 import { createReplaySeed, createSeededRandom } from '@/utils/seededRandom';
 
+import AimOverlay from './AimOverlay';
+import BoardHud from './BoardHud';
+import {
+  BOARD_HEIGHT,
+  BOARD_WIDTH,
+  BIND_TURNS,
+  COMBO_MULT_STEP,
+  DROP_COOLDOWN_MS,
+  DROP_Y,
+  GAME_OVER_LINE_Y,
+  MIMIC_TURNS,
+  PLAYBACK_SIM_STEP_MS,
+  TRICK_ROOM_TURNS,
+  WALL_THICKNESS,
+} from './constants';
+import GameOverModal from '@/components/portalModal/gameOverModal/GameOverModal';
+import SaveReplayModal from '@/components/portalModal/saveReplayModal/SaveReplayModal';
+import SkillSelectModal from '@/components/portalModal/skillSelectModal/SkillSelectModal';
+
+import IdleStartOverlay from './IdleStartOverlay';
+import {
+  clampBallToCutline,
+  createBallBody,
+  isFieldBall,
+  replaceBallTier,
+  replaySimTime,
+  resetSimClock,
+  restartRunner,
+  stepPlaybackPhysicsOnce,
+} from './physics';
+import ReplayControls from './ReplayControls';
+import SkillSidePanel from './SkillSidePanel';
+import TierLegend from './TierLegend';
+import type {
+  AimMode,
+  BallBody,
+  BallProps,
+  GamePhase,
+  PlaybackRate,
+} from './types';
+
+export { BOARD_HEIGHT, BOARD_WIDTH } from './constants';
+
 const { Engine, Render, Runner, Bodies, Body, Composite, Events, World } =
   Matter;
-
-export const BOARD_WIDTH = 400;
-export const BOARD_HEIGHT = 560;
-const WALL_THICKNESS = 40;
-const DROP_Y = 56;
-const DROP_COOLDOWN_MS = 450;
-const GAME_OVER_LINE_Y = 110;
-const COMBO_MULT_STEP = 0.1;
-const TRICK_ROOM_TURNS = 10;
-const MIMIC_TURNS = 3;
-const BIND_TURNS = 3;
-const SKILL_PANEL_WIDTH = 200;
-const PLAYBACK_RATES = [0.5, 1, 1.5, 2] as const;
-const PLAYBACK_SIM_STEP_MS = 1000 / 60;
-type PlaybackRate = (typeof PLAYBACK_RATES)[number];
-
-type GamePhase = 'idle' | 'selecting' | 'playing' | 'gameover' | 'replay';
-type AimMode = null | 'shrink' | 'trick' | 'blowAway';
-
-function formatPlaybackTime(ms: number) {
-  const totalSec = Math.max(0, Math.floor(ms / 1000));
-  const min = Math.floor(totalSec / 60);
-  const sec = totalSec % 60;
-  return `${min}:${String(sec).padStart(2, '0')}`;
-}
-
-/** Matter 0.20: Runner.run은 기존 RAF를 끊지 않아 중첩되면 물리가 배속으로 돌아감 */
-function restartRunner(runner: Matter.Runner, engine: Matter.Engine) {
-  Runner.stop(runner);
-  Runner.run(runner, engine);
-}
-
-/** 라이브 Runner 와 동일하게 고정 16.67ms 스텝만 사용 (가변 delta → 튕김) */
-function resetSimClock(engine: Matter.Engine) {
-  engine.timing.timeScale = 1;
-  engine.timing.timestamp = 0;
-  engine.timing.lastDelta = 0;
-}
-
-function replaySimTime(engine: Matter.Engine | null): number {
-  // floor 로 고정 스텝 경계와 맞춤 (round 시 17,33… 으로 어긋나 한 스텝 늦게 적용됨)
-  return Math.max(0, Math.floor((engine?.timing.timestamp ?? 0) + 1e-6));
-}
-
-function stepPlaybackPhysicsOnce(engine: Matter.Engine) {
-  engine.timing.timeScale = 1;
-  Engine.update(engine, PLAYBACK_SIM_STEP_MS);
-}
-
-type BallBody = Matter.Body & {
-  plugin: {
-    tierId: number;
-    merging?: boolean;
-  };
-};
-
-function clampBallToCutline(body: BallBody) {
-  const r = body.circleRadius ?? 0;
-  const minY = GAME_OVER_LINE_Y + r;
-  if (body.position.y < minY) {
-    Body.setPosition(body, { x: body.position.x, y: minY });
-    if (body.velocity.y < 0) {
-      Body.setVelocity(body, { x: body.velocity.x, y: 0 });
-    }
-  }
-}
-
-type BallProps = {
-  onScoreChange?: (score: number) => void;
-  onGameOverChange?: (over: boolean) => void;
-  /** 비로그인으로 게임 시작 시 게스트 ID 전달 */
-  onGuestSession?: (guestId: string) => void;
-  /** 리플레이 저장 성공 시 */
-  onReplaySaved?: () => void;
-  /** 재생할 리플레이 (변경 시 보드에서 재생) */
-  replayToPlay?: ReplayData | null;
-  onReplayFinished?: () => void;
-};
-
-function createBallBody(x: number, y: number, tierId: number): BallBody {
-  const tier = getTier(tierId);
-  const body = Bodies.circle(x, y, tier.radius, {
-    restitution: 0.12,
-    friction: 0.35,
-    frictionAir: 0.012,
-    density: 0.002 + tierId * 0.00025,
-    label: `ball-${tierId}`,
-    render: {
-      fillStyle: tier.color,
-      strokeStyle: tier.stroke,
-      lineWidth: 2,
-    },
-  }) as BallBody;
-
-  body.plugin = { tierId };
-  return body;
-}
-
-function isFieldBall(body: Matter.Body): body is BallBody {
-  return (
-    !!body.label?.startsWith('ball-') &&
-    !(body as BallBody).isSensor &&
-    !!(body as BallBody).plugin
-  );
-}
-
-function replaceBallTier(
-  engine: Matter.Engine,
-  body: BallBody,
-  newTierId: number,
-): BallBody {
-  const { x, y } = body.position;
-  const vel = { ...body.velocity };
-  const angle = body.angle;
-  Composite.remove(engine.world, body);
-  const next = createBallBody(x, y, newTierId);
-  Body.setVelocity(next, vel);
-  Body.setAngle(next, angle);
-  Composite.add(engine.world, next);
-  return next;
-}
 
 export default function Ball({
   onScoreChange,
@@ -1781,283 +1701,66 @@ export default function Ball({
         style={{ width: BOARD_WIDTH }}
       >
         {showSidePanel ? (
-          <aside
-            className="absolute bottom-0 flex flex-col gap-1.5"
-            style={{
-              width: SKILL_PANEL_WIDTH,
-              right: `calc(100% + 8px)`,
-            }}
-          >
-            {phase === 'playing' ? (
-              <div className="grid grid-cols-2 gap-1.5">
-                <button
-                  type="button"
-                  className="rounded-md border border-slate-500 bg-slate-900 px-1.5 py-1.5 text-[11px] font-semibold text-slate-100 hover:border-emerald-400 hover:text-emerald-200"
-                  onClick={goIdle}
-                >
-                  재시작
-                </button>
-                <button
-                  type="button"
-                  className="rounded-md border border-slate-500 bg-slate-900 px-1.5 py-1.5 text-[11px] font-semibold text-slate-100 hover:border-rose-400 hover:text-rose-200"
-                  onClick={quickEnd}
-                >
-                  빠른종료
-                </button>
-              </div>
-            ) : (
-              <p className="rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-center text-[10px] text-amber-200">
-                {playbackPaused ? '일시정지' : '재생 중'} · {playbackRate}x
-              </p>
-            )}
-            {equipped.length > 0 ? (
-              <div className="grid grid-cols-2 gap-1.5">
-                {equipped.map((id) => {
-                  const skill = getSkill(id);
-                  const canAfford = pp >= skill.cost && phase === 'playing';
-                  const active = aimMode === id;
-                  return (
-                    <button
-                      key={id}
-                      type="button"
-                      disabled={phase !== 'playing'}
-                      title={`${skill.description} (PP ${skill.cost})`}
-                      onClick={() => activateSkill(id)}
-                      className={`flex min-h-[72px] flex-col rounded-md border px-1.5 py-1.5 text-left leading-tight transition disabled:cursor-default ${
-                        active
-                          ? 'border-amber-300 bg-amber-400/90 text-slate-950'
-                          : canAfford
-                            ? 'border-slate-500 bg-slate-900 text-slate-100 hover:border-sky-300'
-                            : 'border-slate-700 bg-slate-950 text-slate-500'
-                      }`}
-                    >
-                      <div className="text-[11px] font-bold">{skill.name}</div>
-                      <div className="text-[9px] opacity-80">PP {skill.cost}</div>
-                      <p
-                        className={`mt-auto pt-1 text-[9px] leading-snug ${
-                          active ? 'text-slate-800' : 'text-slate-400'
-                        }`}
-                      >
-                        {skill.description}
-                      </p>
-                    </button>
-                  );
-                })}
-              </div>
-            ) : null}
-          </aside>
+          <SkillSidePanel
+            phase={phase}
+            equipped={equipped}
+            pp={pp}
+            aimMode={aimMode}
+            playbackPaused={playbackPaused}
+            playbackRate={playbackRate}
+            onRestart={goIdle}
+            onQuickEnd={quickEnd}
+            onActivateSkill={activateSkill}
+          />
         ) : null}
-          {showHud ? (
-            <div className="flex items-center justify-between gap-3 text-sm text-slate-200">
-              <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1">
-                <div className="font-semibold tabular-nums">점수 {score}</div>
-                <div className="tabular-nums text-sky-300">PP {pp}</div>
-                {combo >= 1 ? (
-                  <span className="text-amber-300 tabular-nums">
-                    {combo}콤보 ×{comboMultiplier}
-                  </span>
-                ) : null}
-              </div>
-              <div className="flex items-center gap-2">
-                <span className="text-slate-400">다음</span>
-                <span
-                  className="inline-flex h-8 w-8 items-center justify-center rounded-full border-2 text-[10px] font-bold"
-                  style={{
-                    background: getTier(nextTierId).color,
-                    borderColor: getTier(nextTierId).stroke,
-                    color: '#0f172a',
-                  }}
-                  title={getTier(nextTierId).name}
-                >
-                  {getTier(nextTierId).name.slice(0, 1)}
-                </span>
-                <span className="text-slate-400">현재</span>
-                <span
-                  className="inline-flex h-8 w-8 items-center justify-center rounded-full border-2 text-[10px] font-bold"
-                  style={{
-                    background: getTier(currentTierId).color,
-                    borderColor: getTier(currentTierId).stroke,
-                    color: '#0f172a',
-                  }}
-                  title={getTier(currentTierId).name}
-                >
-                  {getTier(currentTierId).name.slice(0, 1)}
-                </span>
-              </div>
-            </div>
-          ) : null}
 
-          {buffLabel ? (
-            <p className="text-left text-xs text-violet-300">{buffLabel}</p>
-          ) : null}
+        {showHud ? (
+          <BoardHud
+            score={score}
+            pp={pp}
+            combo={combo}
+            comboMultiplier={comboMultiplier}
+            currentTierId={currentTierId}
+            nextTierId={nextTierId}
+            buffLabel={buffLabel}
+          />
+        ) : null}
 
-          <div
-            ref={hostRef}
-            className="relative touch-none overflow-hidden rounded-xl border border-slate-600 shadow-lg"
-            style={{ width: BOARD_WIDTH, height: BOARD_HEIGHT }}
-            onMouseMove={(e) => handleBoardPointer(e.clientX, e.clientY, false)}
-            onClick={(e) => handleBoardPointer(e.clientX, e.clientY, true)}
-            onTouchMove={(e) => {
-              const t = e.touches[0];
-              if (t) handleBoardPointer(t.clientX, t.clientY, false);
-            }}
-            onTouchEnd={(e) => {
-              e.preventDefault();
-              const t = e.changedTouches[0];
-              if (t) handleBoardPointer(t.clientX, t.clientY, true);
-            }}
-            role="application"
-            aria-label="수박 게임 보드"
-          >
+        <div
+          ref={hostRef}
+          className="relative touch-none overflow-hidden rounded-xl border border-slate-600 shadow-lg"
+          style={{ width: BOARD_WIDTH, height: BOARD_HEIGHT }}
+          onMouseMove={(e) => handleBoardPointer(e.clientX, e.clientY, false)}
+          onClick={(e) => handleBoardPointer(e.clientX, e.clientY, true)}
+          onTouchMove={(e) => {
+            const t = e.touches[0];
+            if (t) handleBoardPointer(t.clientX, t.clientY, false);
+          }}
+          onTouchEnd={(e) => {
+            e.preventDefault();
+            const t = e.changedTouches[0];
+            if (t) handleBoardPointer(t.clientX, t.clientY, true);
+          }}
+          role="application"
+          aria-label="수박 게임 보드"
+        >
           {phase === 'idle' ? (
-            <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-3 bg-slate-950/70 px-6">
-              <button
-                type="button"
-                className="rounded-full bg-emerald-500 px-6 py-2.5 text-base font-bold text-slate-950 hover:bg-emerald-400"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setPickedSkills([]);
-                  setPhase('selecting');
-                }}
-              >
-                게임 시작
-              </button>
-            </div>
+            <IdleStartOverlay
+              onStart={() => {
+                setPickedSkills([]);
+                setPhase('selecting');
+              }}
+            />
           ) : null}
 
-          {phase === 'selecting' ? (
-            <div
-              className="absolute inset-0 z-20 flex flex-col gap-2 overflow-y-auto bg-slate-950/92 p-3"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <p className="text-center text-sm font-semibold text-white">
-                기술 선택 최대 4개 ({pickedSkills.length}/
-                {SKILL_PICK_COUNT})
-              </p>
-              <ul className="flex flex-col gap-1.5">
-                {SKILLS.map((skill) => {
-                  const on = pickedSkills.includes(skill.id);
-                  const full =
-                    !on && pickedSkills.length >= SKILL_PICK_COUNT;
-                  return (
-                    <li key={skill.id}>
-                      <button
-                        type="button"
-                        disabled={full}
-                        onClick={() => togglePick(skill.id)}
-                        className={`w-full rounded-lg border px-2.5 py-2 text-left transition ${
-                          on
-                            ? 'border-emerald-400 bg-emerald-500/20 text-emerald-100'
-                            : 'border-slate-600 bg-slate-900/80 text-slate-200 hover:border-slate-400'
-                        } disabled:cursor-not-allowed disabled:opacity-40`}
-                      >
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-sm font-semibold">
-                            {skill.name}
-                          </span>
-                          <span className="text-xs text-sky-300">
-                            PP {skill.cost}
-                          </span>
-                        </div>
-                        <p className="mt-0.5 text-[11px] text-slate-400">
-                          {skill.description}
-                        </p>
-                      </button>
-                    </li>
-                  );
-                })}
-              </ul>
-              <div className="mt-auto flex gap-2 pt-1">
-                <button
-                  type="button"
-                  className="flex-1 rounded-full border border-slate-500 px-3 py-2 text-sm text-slate-200 hover:bg-slate-800"
-                  onClick={goIdle}
-                >
-                  취소
-                </button>
-                <button
-                  type="button"
-                  className="flex-1 rounded-full bg-emerald-500 px-3 py-2 text-sm font-semibold text-slate-950 hover:bg-emerald-400"
-                  onClick={beginPlay}
-                >
-                  시작
-                </button>
-              </div>
-            </div>
-          ) : null}
-
-          {aimMode === 'blowAway' ? (
-            <div
-              className="absolute inset-x-0 top-3 z-20 mx-2 rounded-lg border border-amber-300/80 bg-slate-950/92 p-2"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <p className="mb-2 text-center text-xs font-semibold text-amber-200">
-                {aimHint}
-              </p>
-              <div className="flex flex-wrap justify-center gap-1.5">
-                {Array.from({ length: DROP_TIER_MAX + 1 }, (_, id) => {
-                  const tier = getTier(id);
-                  const disabled =
-                    id === currentTierId ||
-                    (boundTierId != null && id === boundTierId);
-                  return (
-                    <button
-                      key={id}
-                      type="button"
-                      disabled={disabled}
-                      onClick={() => applyBlowAway(id)}
-                      className="inline-flex flex-col items-center gap-0.5 rounded-md border px-1.5 py-1 disabled:cursor-not-allowed disabled:opacity-35"
-                      style={{
-                        background: tier.color,
-                        borderColor: tier.stroke,
-                        color: '#0f172a',
-                      }}
-                    >
-                      <span
-                        className="inline-flex items-center justify-center rounded-full border-2 text-[10px] font-bold"
-                        style={{
-                          width: Math.max(22, tier.radius),
-                          height: Math.max(22, tier.radius),
-                          borderColor: tier.stroke,
-                          background: tier.color,
-                        }}
-                      >
-                        {tier.name.slice(0, 1)}
-                      </span>
-                      <span className="text-[9px] font-semibold">
-                        {tier.name}
-                      </span>
-                    </button>
-                  );
-                })}
-              </div>
-              <div className="mt-2 flex justify-center">
-                <button
-                  type="button"
-                  className="rounded-full border border-slate-400 bg-slate-900/90 px-2 py-0.5 text-[10px] text-slate-200"
-                  onClick={cancelAim}
-                >
-                  취소
-                </button>
-              </div>
-            </div>
-          ) : aimMode ? (
-            <div className="pointer-events-none absolute inset-x-0 top-3 z-10 flex flex-col items-center gap-1">
-              <span className="rounded-full bg-amber-400/95 px-3 py-1 text-xs font-bold text-slate-950">
-                {aimHint}
-              </span>
-              <button
-                type="button"
-                className="pointer-events-auto rounded-full border border-slate-400 bg-slate-900/90 px-2 py-0.5 text-[10px] text-slate-200"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  cancelAim();
-                }}
-              >
-                취소
-              </button>
-            </div>
-          ) : null}
+          <AimOverlay
+            aimMode={aimMode}
+            aimHint={aimHint}
+            currentTierId={currentTierId}
+            boundTierId={boundTierId}
+            onBlowAway={applyBlowAway}
+            onCancel={cancelAim}
+          />
 
           {combo >= 1 && phase === 'playing' ? (
             <div
@@ -2070,140 +1773,43 @@ export default function Ball({
               </span>
             </div>
           ) : null}
-
-          {phase === 'gameover' ? (
-            <div
-              className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-2 bg-slate-950/75 px-6 backdrop-blur-[2px]"
-              onClick={(e) => e.stopPropagation()}
-              role="dialog"
-              aria-modal="true"
-              aria-label="게임 오버"
-            >
-              <p className="text-lg font-bold text-rose-200">게임 오버</p>
-              <p className="text-sm text-slate-200">
-                최종 점수 {score} · PP {pp}
-              </p>
-              {replaySaveMsg ? (
-                <p className="text-xs text-sky-300">{replaySaveMsg}</p>
-              ) : null}
-              <button
-                type="button"
-                className="mt-1 rounded-full bg-emerald-500 px-5 py-2 text-sm font-semibold text-slate-950 hover:bg-emerald-400"
-                onClick={goIdle}
-              >
-                다시 하기
-              </button>
-            </div>
-          ) : null}
-          </div>
+        </div>
       </div>
 
-      {savePromptOpen ? (
-        <BasicModal
-          setOnModal={(open) => {
-            if (open) setSavePromptOpen(true);
-            else skipSaveReplay();
-          }}
-          dimClick={false}
-          className="max-w-xs gap-3 text-center"
-        >
-          <h2 className="text-base font-bold text-white">기록 저장</h2>
-          <p className="text-sm text-slate-300">
-            이번 플레이 기록을 저장할까요?
-          </p>
-          <div className="mt-1 flex justify-center gap-2">
-            <button
-              type="button"
-              className="rounded-full bg-emerald-500 px-5 py-1.5 text-sm font-semibold text-slate-950 hover:bg-emerald-400"
-              onClick={confirmSaveReplay}
-            >
-              예
-            </button>
-            <button
-              type="button"
-              className="rounded-full border border-slate-500 bg-slate-900 px-5 py-1.5 text-sm font-semibold text-slate-100 hover:border-slate-300"
-              onClick={skipSaveReplay}
-            >
-              아니오
-            </button>
-          </div>
-        </BasicModal>
-      ) : null}
+      <SkillSelectModal
+        open={phase === 'selecting'}
+        pickedSkills={pickedSkills}
+        onToggle={togglePick}
+        onCancel={goIdle}
+        onStart={beginPlay}
+      />
+
+      <GameOverModal
+        open={phase === 'gameover'}
+        score={score}
+        pp={pp}
+        saveMessage={replaySaveMsg}
+        onRetry={goIdle}
+      />
+
+      <SaveReplayModal
+        open={savePromptOpen}
+        onConfirm={confirmSaveReplay}
+        onSkip={skipSaveReplay}
+      />
 
       {phase === 'replay' ? (
-        <div
-          className="flex flex-col gap-2 rounded-xl border border-slate-700 bg-slate-900/80 px-3 py-2.5"
-          style={{ width: BOARD_WIDTH }}
-          onClick={(e) => e.stopPropagation()}
-          onPointerDown={(e) => e.stopPropagation()}
-        >
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              title={playbackPaused ? '재생' : '일시정지'}
-              className="shrink-0 rounded-md border border-amber-400/70 bg-amber-500/20 px-2.5 py-1.5 text-xs font-semibold text-amber-100 hover:bg-amber-500/30"
-              onClick={(e) => {
-                e.stopPropagation();
-                togglePlaybackPause();
-              }}
-            >
-              {playbackPaused ? '▶' : '❚❚'}
-            </button>
-            <input
-              type="range"
-              min={0}
-              max={playbackDurationMs}
-              step={1}
-              value={Math.min(playbackElapsedMs, playbackDurationMs)}
-              aria-label="재생 위치"
-              className="h-2 flex-1 cursor-pointer accent-amber-400"
-              onPointerDown={(e) => {
-                e.stopPropagation();
-                if (!playbackPausedRef.current) pausePlayback();
-              }}
-              onClick={(e) => e.stopPropagation()}
-              onChange={(e) => {
-                e.stopPropagation();
-                queueSeekToTime(Number(e.target.value));
-              }}
-            />
-            <span className="shrink-0 tabular-nums text-[11px] text-slate-300">
-              {formatPlaybackTime(playbackElapsedMs)} /{' '}
-              {formatPlaybackTime(playbackDurationMs)}
-            </span>
-          </div>
-          <div className="flex items-center justify-between gap-2">
-            <div className="flex flex-wrap gap-1">
-              {PLAYBACK_RATES.map((rate) => (
-                <button
-                  key={rate}
-                  type="button"
-                  className={`rounded-md border px-2 py-1 text-[11px] font-semibold ${
-                    playbackRate === rate
-                      ? 'border-amber-400 bg-amber-500/25 text-amber-100'
-                      : 'border-slate-600 bg-slate-950 text-slate-300 hover:border-slate-400'
-                  }`}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    changePlaybackRate(rate);
-                  }}
-                >
-                  {rate}x
-                </button>
-              ))}
-            </div>
-            <button
-              type="button"
-              className="rounded-md border border-slate-500 bg-slate-900 px-2.5 py-1 text-[11px] font-semibold text-slate-100 hover:border-rose-400 hover:text-rose-200"
-              onClick={(e) => {
-                e.stopPropagation();
-                goIdle();
-              }}
-            >
-              재생 종료
-            </button>
-          </div>
-        </div>
+        <ReplayControls
+          playbackPaused={playbackPaused}
+          playbackRate={playbackRate}
+          playbackElapsedMs={playbackElapsedMs}
+          playbackDurationMs={playbackDurationMs}
+          onTogglePause={togglePlaybackPause}
+          onPause={pausePlayback}
+          onSeek={queueSeekToTime}
+          onChangeRate={changePlaybackRate}
+          onStop={goIdle}
+        />
       ) : (
         <p className="min-h-5 text-center text-xs text-slate-400">
           {phase === 'playing'
@@ -2212,21 +1818,7 @@ export default function Ball({
         </p>
       )}
 
-      <div className="flex flex-wrap justify-center gap-1.5 opacity-90">
-        {BALL_TIERS.map((tier) => (
-          <span
-            key={tier.id}
-            className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] text-slate-900"
-            style={{
-              background: tier.color,
-              border: `1px solid ${tier.stroke}`,
-            }}
-            title={`단계 ${tier.id + 1}`}
-          >
-            {tier.name}
-          </span>
-        ))}
-      </div>
+      <TierLegend />
     </div>
   );
 }

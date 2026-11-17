@@ -5,48 +5,48 @@
   width: 100%;
   height: 100%;
   z-index: 20;
+
   &.page {
     position: absolute;
+
     .modal_container {
       width: 430px;
       height: 100%;
     }
   }
 }
+
 .modal_container {
   position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 0;
-  right: 0;
+  inset: 0;
   width: 100%;
   height: 100%;
   z-index: 1;
-
   display: flex;
   margin: auto;
   align-items: center;
   justify-content: center;
 }
+
 .modal_content {
   position: relative;
   display: flex;
   flex-direction: column;
-  // width: 100%;
-  // height: 100%;
   width: 700px;
   height: 800px;
-  @include media-mo () {
-    width: calc(100% - 40px);
-    height: calc(100vh - 150px);
-  }
-  padding: 20px 20px 30px 20px;
+  padding: 20px 20px 30px;
   border: 1px solid #ccc;
   border-radius: 12px;
   background: white;
   box-sizing: border-box;
   z-index: 10;
+
+  @include media-mo {
+    width: calc(100% - 40px);
+    height: calc(100vh - 150px);
+  }
 }
+
 .close {
   position: absolute;
   display: inline-flex;
@@ -54,9 +54,120 @@
   right: 20px;
   top: 20px;
 }
+
 .dim {
   position: absolute;
   inset: 0;
   background: rgba(0, 0, 0, 0.3);
   z-index: 0;
+}
+
+/* —— 게임 모달 공통 —— */
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  color: $color-slate-100;
+}
+
+.panelCompact {
+  max-width: 320px;
+  text-align: center;
+  gap: 12px;
+}
+
+.panelMedium {
+  max-width: 384px;
+  gap: 8px;
+}
+
+.title {
+  margin: 0;
+  padding-right: 28px;
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1.3;
+  color: #fff;
+}
+
+.titleDanger {
+  margin: 0;
+  padding-right: 28px;
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1.3;
+  color: $color-rose-200;
+}
+
+.description {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.45;
+  color: $color-slate-300;
+}
+
+.meta {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.4;
+  color: $color-sky-300;
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.actionsCenter {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+  justify-content: center;
+}
+
+.btn {
+  border-radius: 999px;
+  padding: 8px 20px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.15s ease, border-color 0.15s ease,
+    color 0.15s ease;
+}
+
+.btnPrimary {
+  border: none;
+  border-radius: 999px;
+  padding: 8px 20px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  background: $color-emerald-500;
+  color: $color-slate-950;
+  transition: background-color 0.15s ease;
+
+  &:hover {
+    background: $color-emerald-400;
+  }
+}
+
+.btnSecondary {
+  border: 1px solid $color-slate-600;
+  border-radius: 999px;
+  padding: 8px 20px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  background: $color-slate-900;
+  color: $color-slate-100;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+
+  &:hover {
+    border-color: $color-slate-400;
+  }
+}
+
+.btnGrow {
+  flex: 1;
 }
