@@ -9,8 +9,10 @@ import {
 
 import Ball from '@/components/ball/Ball';
 import BasicModal from '@/components/portalModal/basicModal/BasicModal';
+import ConfirmModal from '@/components/portalModal/confirmModal/ConfirmModal';
 import type { ReplayData, ReplayListItem } from '@/types/replay';
 import {
+  getGuestUserIdHistory,
   getOrCreateGuestIdentity,
   readStoredGuestId,
 } from '@/utils/guestId';
@@ -32,6 +34,8 @@ export default function Home() {
   const [replayLoading, setReplayLoading] = useState(false);
   const [replayError, setReplayError] = useState('');
   const [replayToPlay, setReplayToPlay] = useState<ReplayData | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<ReplayListItem | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   const handleReplaySaved = useCallback(() => {
     const { guestId: displayId } = getOrCreateGuestIdentity();
@@ -44,14 +48,20 @@ export default function Home() {
 
   const openReplayModal = async () => {
     const { guestId: displayId, userId } = getOrCreateGuestIdentity();
+    const historyIds = getGuestUserIdHistory();
     setGuestIdOverride(displayId);
     setReplayModal(true);
+    setDeleteTarget(null);
     setReplayLoading(true);
     setReplayError('');
     try {
-      const res = await fetch(
-        `/api/game-replays?userId=${encodeURIComponent(userId)}`,
-      );
+      const params = new URLSearchParams();
+      params.set('userId', userId);
+      params.set('guestId', displayId);
+      if (historyIds.length > 0) {
+        params.set('userIds', historyIds.join(','));
+      }
+      const res = await fetch(`/api/game-replays?${params.toString()}`);
       const json = (await res.json()) as {
         ok?: boolean;
         items?: ReplayListItem[];
@@ -91,6 +101,39 @@ export default function Home() {
       setReplayError(
         error instanceof Error ? error.message : '기록을 불러오지 못했습니다',
       );
+    }
+  };
+
+  const confirmDeleteReplay = async () => {
+    if (!deleteTarget || deleting) return;
+    const targetId = deleteTarget.id;
+    const { userId } = getOrCreateGuestIdentity();
+    const historyIds = getGuestUserIdHistory();
+    setDeleting(true);
+    setReplayError('');
+    try {
+      const params = new URLSearchParams();
+      params.set('userId', userId);
+      if (historyIds.length > 0) {
+        params.set('userIds', historyIds.join(','));
+      }
+      const res = await fetch(
+        `/api/game-replays/${targetId}?${params.toString()}`,
+        { method: 'DELETE' },
+      );
+      const json = (await res.json()) as { ok?: boolean; error?: string };
+      if (!res.ok || !json.ok) {
+        setReplayError(json.error ?? '기록을 삭제하지 못했습니다');
+        return;
+      }
+      setReplayItems((prev) => prev.filter((item) => item.id !== targetId));
+    } catch (error) {
+      setReplayError(
+        error instanceof Error ? error.message : '기록을 삭제하지 못했습니다',
+      );
+    } finally {
+      setDeleting(false);
+      setDeleteTarget(null);
     }
   };
 
@@ -167,15 +210,22 @@ export default function Home() {
 
       {replayModal ? (
         <BasicModal setOnModal={setReplayModal} dimClick className="gap-3">
-          <h2 className="pr-8 text-lg font-bold text-white">플레이 기록</h2>
+          <h2 className="pr-8 text-lg font-bold text-white">
+            플레이 기록
+            {!replayLoading && replayItems.length > 0
+              ? ` (${replayItems.length})`
+              : ''}
+          </h2>
           <p className="text-xs text-slate-400">
             기록을 선택하면 보드에서 재생됩니다.
           </p>
 
+          {replayError ? (
+            <p className="text-sm text-rose-300">{replayError}</p>
+          ) : null}
+
           {replayLoading ? (
             <p className="py-8 text-center text-sm text-slate-400">불러오는 중…</p>
-          ) : replayError ? (
-            <p className="py-8 text-center text-sm text-rose-300">{replayError}</p>
           ) : replayItems.length === 0 ? (
             <p className="py-8 text-center text-sm text-slate-400">
               저장된 기록이 없습니다.
@@ -183,13 +233,16 @@ export default function Home() {
           ) : (
             <ul className="mt-2 max-h-[420px] space-y-2 overflow-y-auto pr-1">
               {replayItems.map((item) => (
-                <li key={item.id}>
+                <li
+                  key={item.id}
+                  className="flex items-stretch gap-2 rounded-lg border border-slate-600 bg-slate-950/70 p-1.5"
+                >
                   <button
                     type="button"
-                    className="flex w-full items-center justify-between gap-3 rounded-lg border border-slate-600 bg-slate-950/70 px-3 py-2.5 text-left transition hover:border-sky-400 hover:bg-slate-800/80"
+                    className="flex min-w-0 flex-1 items-center justify-between gap-3 rounded-md px-2.5 py-2 text-left transition hover:bg-slate-800/80"
                     onClick={() => void playReplayItem(item.id)}
                   >
-                    <div>
+                    <div className="min-w-0">
                       <p className="text-sm font-semibold text-slate-100">
                         점수 {item.score}
                         {item.max_grade != null ? (
@@ -205,15 +258,52 @@ export default function Home() {
                           : ''}
                       </p>
                     </div>
-                    <span className="text-xs font-semibold text-sky-300">
+                    <span className="shrink-0 text-xs font-semibold text-sky-300">
                       재생
                     </span>
+                  </button>
+                  <button
+                    type="button"
+                    className="shrink-0 self-center rounded-md border border-rose-500/40 bg-rose-500/10 px-2.5 py-2 text-xs font-semibold text-rose-300 hover:bg-rose-500/20 disabled:opacity-50"
+                    disabled={deleting}
+                    onClick={() => {
+                      setReplayError('');
+                      setDeleteTarget(item);
+                    }}
+                  >
+                    삭제
                   </button>
                 </li>
               ))}
             </ul>
           )}
         </BasicModal>
+      ) : null}
+
+      {deleteTarget ? (
+        <ConfirmModal
+          setOnModal={(next) => {
+            const open =
+              typeof next === 'function' ? next(true) : next;
+            if (!open) setDeleteTarget(null);
+          }}
+          dimClick
+          danger
+          title="기록 삭제"
+          confirmLabel={deleting ? '삭제 중…' : '삭제'}
+          onConfirm={() => confirmDeleteReplay()}
+        >
+          <p className="text-sm text-slate-300">
+            점수 {deleteTarget.score}
+            {deleteTarget.duration_sec != null
+              ? ` · ${deleteTarget.duration_sec}초`
+              : ''}{' '}
+            기록을 삭제할까요?
+          </p>
+          <p className="mt-1 text-xs text-slate-500">
+            삭제하면 다시 볼 수 없습니다.
+          </p>
+        </ConfirmModal>
       ) : null}
     </main>
   );

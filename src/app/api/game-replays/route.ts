@@ -7,6 +7,8 @@ const GUEST_PATTERN = /^guest\d{5}$/;
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+const LIST_LIMIT = 200;
+
 function isReplayData(value: unknown): value is ReplayData {
   if (!value || typeof value !== 'object') return false;
   const v = value as ReplayData;
@@ -20,7 +22,7 @@ function isReplayData(value: unknown): value is ReplayData {
 
 /**
  * game_replays.user_id → auth.users FK 를 통과시키기 위해
- * 게스트 UUID 가 없으면 auth 유저를 만든다.
+ * 게스트 UUID 가 없으면 auth 유저를 만든다. 있으면 guestId 메타데이터를 맞춘다.
  */
 async function ensureAuthUserForGuest(
   supabase: ReturnType<typeof createAdminClient>,
@@ -28,7 +30,21 @@ async function ensureAuthUserForGuest(
   guestId: string | null,
 ) {
   const existing = await supabase.auth.admin.getUserById(userId);
-  if (existing.data.user) return;
+  if (existing.data.user) {
+    if (
+      guestId &&
+      existing.data.user.user_metadata?.guestId !== guestId
+    ) {
+      await supabase.auth.admin.updateUserById(userId, {
+        user_metadata: {
+          ...existing.data.user.user_metadata,
+          guest: true,
+          guestId,
+        },
+      });
+    }
+    return;
+  }
 
   const emailLocal = userId.replace(/-/g, '').slice(0, 16);
   const { error } = await supabase.auth.admin.createUser({
@@ -46,31 +62,77 @@ async function ensureAuthUserForGuest(
   }
 }
 
+/** 같은 표시용 guestId 로 만들어진 auth 유저 UUID 모으기 */
+async function findAuthUserIdsByGuestId(
+  supabase: ReturnType<typeof createAdminClient>,
+  guestId: string,
+): Promise<string[]> {
+  const ids: string[] = [];
+  for (let page = 1; page <= 10; page += 1) {
+    const { data, error } = await supabase.auth.admin.listUsers({
+      page,
+      perPage: 100,
+    });
+    if (error || !data?.users?.length) break;
+    for (const user of data.users) {
+      if (user.user_metadata?.guestId === guestId) {
+        ids.push(user.id);
+      }
+    }
+    if (data.users.length < 100) break;
+  }
+  return ids;
+}
+
 /**
- * GET /api/game-replays?userId=<uuid>
- * 게스트·로그인 모두 user_id 로 조회
+ * GET /api/game-replays?userId=<uuid>&userIds=a,b&guestId=guest01234
+ * userId / userIds / guestId(메타데이터 매칭) 를 합쳐 목록 조회
  */
 export async function GET(request: NextRequest) {
   try {
     const userId = request.nextUrl.searchParams.get('userId');
+    const userIdsParam = request.nextUrl.searchParams.get('userIds');
+    const guestId = request.nextUrl.searchParams.get('guestId');
 
-    if (!userId) {
+    const userIds = new Set<string>();
+    if (userId && UUID_PATTERN.test(userId)) userIds.add(userId);
+    if (userIdsParam) {
+      for (const id of userIdsParam.split(',')) {
+        const trimmed = id.trim();
+        if (UUID_PATTERN.test(trimmed)) userIds.add(trimmed);
+      }
+    }
+    if (guestId && !GUEST_PATTERN.test(guestId)) {
+      return Response.json({ ok: false, error: 'invalid guestId' }, { status: 400 });
+    }
+
+    if (userIds.size === 0 && !guestId) {
       return Response.json(
-        { ok: false, error: 'userId required' },
+        { ok: false, error: 'userId or guestId required' },
         { status: 400 },
       );
     }
-    if (!UUID_PATTERN.test(userId)) {
-      return Response.json({ ok: false, error: 'invalid userId' }, { status: 400 });
-    }
 
     const supabase = createAdminClient();
+
+    if (guestId) {
+      const linked = await findAuthUserIdsByGuestId(supabase, guestId);
+      for (const id of linked) userIds.add(id);
+    }
+
+    if (userIds.size === 0) {
+      return Response.json(
+        { ok: true, items: [] },
+        { headers: { 'Cache-Control': 'no-store' } },
+      );
+    }
+
     const { data, error } = await supabase
       .from('game_replays')
       .select('id, score, max_grade, duration_sec, created_at, user_id')
-      .eq('user_id', userId)
+      .in('user_id', [...userIds])
       .order('created_at', { ascending: false })
-      .limit(50);
+      .limit(LIST_LIMIT);
 
     if (error) {
       console.error('[GET /api/game-replays]', error);
@@ -81,7 +143,7 @@ export async function GET(request: NextRequest) {
     }
 
     return Response.json(
-      { ok: true, items: data ?? [] },
+      { ok: true, items: data ?? [], total: data?.length ?? 0 },
       { headers: { 'Cache-Control': 'no-store' } },
     );
   } catch (error) {

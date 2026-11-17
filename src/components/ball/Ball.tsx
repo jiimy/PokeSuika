@@ -50,19 +50,27 @@ function formatPlaybackTime(ms: number) {
   return `${min}:${String(sec).padStart(2, '0')}`;
 }
 
-/** 시크 시 액션 사이 물리 시간을 빠르게 재생해 공 위치를 맞춤 */
-function advancePlaybackPhysics(engine: Matter.Engine, ms: number) {
-  if (ms <= 0) return;
-  let step = PLAYBACK_SIM_STEP_MS;
-  if (ms > 8000) step = PLAYBACK_SIM_STEP_MS * 2;
-  if (ms > 25000) step = PLAYBACK_SIM_STEP_MS * 4;
+/** Matter 0.20: Runner.run은 기존 RAF를 끊지 않아 중첩되면 물리가 배속으로 돌아감 */
+function restartRunner(runner: Matter.Runner, engine: Matter.Engine) {
+  Runner.stop(runner);
+  Runner.run(runner, engine);
+}
 
-  let left = ms;
-  while (left > 0) {
-    const dt = Math.min(step, left);
-    Engine.update(engine, dt);
-    left -= dt;
-  }
+/** 라이브 Runner 와 동일하게 고정 16.67ms 스텝만 사용 (가변 delta → 튕김) */
+function resetSimClock(engine: Matter.Engine) {
+  engine.timing.timeScale = 1;
+  engine.timing.timestamp = 0;
+  engine.timing.lastDelta = 0;
+}
+
+function replaySimTime(engine: Matter.Engine | null): number {
+  // floor 로 고정 스텝 경계와 맞춤 (round 시 17,33… 으로 어긋나 한 스텝 늦게 적용됨)
+  return Math.max(0, Math.floor((engine?.timing.timestamp ?? 0) + 1e-6));
+}
+
+function stepPlaybackPhysicsOnce(engine: Matter.Engine) {
+  engine.timing.timeScale = 1;
+  Engine.update(engine, PLAYBACK_SIM_STEP_MS);
 }
 
 type BallBody = Matter.Body & {
@@ -100,7 +108,7 @@ function createBallBody(x: number, y: number, tierId: number): BallBody {
   const body = Bodies.circle(x, y, tier.radius, {
     restitution: 0.12,
     friction: 0.35,
-    frictionAir: 0.01,
+    frictionAir: 0.012,
     density: 0.002 + tierId * 0.00025,
     label: `ball-${tierId}`,
     render: {
@@ -444,7 +452,9 @@ export default function Ball({
       const x = clampDropX(dropX, tierId);
       const ball = createBallBody(x, DROP_Y, tierId);
       Composite.add(engine.world, ball);
-      if (record) recorderRef.current.recordDrop(x, tierId);
+      if (record) {
+        recorderRef.current.recordDrop(x, tierId, replaySimTime(engine));
+      }
       if (tierId > maxGradeRef.current) maxGradeRef.current = tierId;
 
       currentTierRef.current = nextTierRef.current;
@@ -463,12 +473,16 @@ export default function Ball({
       }
 
       const token = ++playbackDropTokenRef.current;
+      // 재생도 라이브와 같은 쿨다운(배속 시 게임시간 기준으로 나눔)
+      const cooldownMs = isPlaybackRef.current
+        ? DROP_COOLDOWN_MS / (playbackRateRef.current || 1)
+        : DROP_COOLDOWN_MS;
       window.setTimeout(() => {
         if (isPlaybackRef.current && token !== playbackDropTokenRef.current) {
           return;
         }
         finishDrop();
-      }, isPlaybackRef.current ? 120 : DROP_COOLDOWN_MS);
+      }, cooldownMs);
     },
     [clampDropX, spawnPreview, nextDropTier],
   );
@@ -507,6 +521,7 @@ export default function Ball({
 
   const applyBlowAway = useCallback(
     (tierId: number) => {
+      if (isPlaybackRef.current) return;
       if (tierId === currentTierRef.current) return;
       if (tierId < 0 || tierId > DROP_TIER_MAX) return;
       if (
@@ -517,7 +532,11 @@ export default function Ball({
         return;
       }
       if (!spendPp(getSkill('blowAway').cost)) return;
-      recorderRef.current.recordSkill('blowAway', { pokemonType: tierId });
+      recorderRef.current.recordSkill(
+        'blowAway',
+        { phase: 'cast', pokemonType: tierId },
+        replaySimTime(engineRef.current),
+      );
       currentTierRef.current = tierId;
       setCurrentTierId(tierId);
       spawnPreview();
@@ -553,12 +572,17 @@ export default function Ball({
       if (tierId <= 0) return;
       if (!spendPp(getSkill('shrink').cost)) return;
       const lower = Math.floor(rngRef.current() * tierId);
-      recorderRef.current.recordSkill('shrink', {
-        x: target.position.x,
-        y: target.position.y,
-        fromTier: tierId,
-        toTier: lower,
-      });
+      recorderRef.current.recordSkill(
+        'shrink',
+        {
+          phase: 'cast',
+          x: target.position.x,
+          y: target.position.y,
+          fromTier: tierId,
+          toTier: lower,
+        },
+        replaySimTime(engine),
+      );
       replaceBallTier(engine, target, lower);
       cancelAim();
     },
@@ -573,12 +597,17 @@ export default function Ball({
       const posB = { ...b.position };
       const velA = { ...a.velocity };
       const velB = { ...b.velocity };
-      recorderRef.current.recordSkill('trick', {
-        x: posA.x,
-        y: posA.y,
-        x2: posB.x,
-        y2: posB.y,
-      });
+      recorderRef.current.recordSkill(
+        'trick',
+        {
+          phase: 'cast',
+          x: posA.x,
+          y: posA.y,
+          x2: posB.x,
+          y2: posB.y,
+        },
+        replaySimTime(engineRef.current),
+      );
       Body.setPosition(a, posB);
       Body.setPosition(b, posA);
       Body.setVelocity(a, velB);
@@ -600,15 +629,22 @@ export default function Ball({
       if (isPlaybackRef.current) return;
 
       const preview = previewRef.current;
-      if (preview && playingRef.current && !gameOverRef.current && !aimModeRef.current) {
+      // 조준 중에는 MOVE 를 남기지 않음 (재생 시 프리뷰가 흔들리는 것 방지)
+      if (
+        preview &&
+        playingRef.current &&
+        !gameOverRef.current &&
+        !aimModeRef.current
+      ) {
         const clampedX = clampDropX(x, currentTierRef.current);
         Body.setPosition(preview, {
           x: clampedX,
           y: DROP_Y,
         });
-        recorderRef.current.recordMove(clampedX);
-      } else if (playingRef.current && !gameOverRef.current) {
-        recorderRef.current.recordMove(x);
+        recorderRef.current.recordMove(
+          clampedX,
+          replaySimTime(engineRef.current),
+        );
       }
 
       if (!isClick || !playingRef.current || gameOverRef.current) return;
@@ -628,6 +664,15 @@ export default function Ball({
         if (!target) return;
         if (!trickPickRef.current) {
           trickPickRef.current = target;
+          recorderRef.current.recordSkill(
+            'trick',
+            {
+              phase: 'pick',
+              x: target.position.x,
+              y: target.position.y,
+            },
+            replaySimTime(engineRef.current),
+          );
           setAimHint('두 번째 공을 선택하세요');
           return;
         }
@@ -652,6 +697,11 @@ export default function Ball({
         trickPickRef.current = null;
         setAimMode('shrink');
         setAimHint('작아질 공을 보드에서 클릭');
+        recorderRef.current.recordSkill(
+          'shrink',
+          { phase: 'aim' },
+          replaySimTime(engine),
+        );
         return;
       }
 
@@ -661,6 +711,11 @@ export default function Ball({
         trickPickRef.current = null;
         setAimMode('trick');
         setAimHint('서로 바꿀 공 2개를 순서대로 클릭');
+        recorderRef.current.recordSkill(
+          'trick',
+          { phase: 'aim' },
+          replaySimTime(engine),
+        );
         return;
       }
 
@@ -670,6 +725,11 @@ export default function Ball({
         trickPickRef.current = null;
         setAimMode('blowAway');
         setAimHint('바꿀 공을 선택하세요');
+        recorderRef.current.recordSkill(
+          'blowAway',
+          { phase: 'aim' },
+          replaySimTime(engine),
+        );
         return;
       }
 
@@ -679,25 +739,33 @@ export default function Ball({
         const rand = rngRef.current;
         quakeSafeRef.current = true;
         quakeSafeUntilRef.current = performance.now() + 500;
+        const quakes: { x: number; y: number; vx: number; vy: number }[] = [];
         for (const body of engine.world.bodies) {
           if (!isFieldBall(body) || body.plugin.merging) continue;
           const r = body.circleRadius ?? 0;
           const minY = GAME_OVER_LINE_Y + r;
           const liftY = Math.max(minY, Math.min(body.position.y, BOARD_HEIGHT * 0.55));
-          Body.setVelocity(body, {
-            x: (rand() - 0.5) * 14,
-            y: -8 - rand() * 5,
-          });
-          Body.setPosition(body, {
-            x: Math.min(
-              BOARD_WIDTH - 20,
-              Math.max(20, body.position.x + (rand() - 0.5) * 40),
-            ),
-            y: liftY,
-          });
+          const vx = (rand() - 0.5) * 14;
+          const vy = -8 - rand() * 5;
+          const nx = Math.min(
+            BOARD_WIDTH - 20,
+            Math.max(20, body.position.x + (rand() - 0.5) * 40),
+          );
+          Body.setVelocity(body, { x: vx, y: vy });
+          Body.setPosition(body, { x: nx, y: liftY });
           clampBallToCutline(body);
+          quakes.push({
+            x: body.position.x,
+            y: body.position.y,
+            vx: body.velocity.x,
+            vy: body.velocity.y,
+          });
         }
-        recorderRef.current.recordSkill('earthquake');
+        recorderRef.current.recordSkill(
+          'earthquake',
+          { phase: 'cast', quakes },
+          replaySimTime(engine),
+        );
         cancelAim();
         return;
       }
@@ -705,7 +773,11 @@ export default function Ball({
       if (id === 'trickRoom') {
         if (!spendPp(skill.cost)) return;
         trickRoomLeftRef.current = TRICK_ROOM_TURNS;
-        recorderRef.current.recordSkill('trickRoom');
+        recorderRef.current.recordSkill(
+          'trickRoom',
+          { phase: 'cast' },
+          replaySimTime(engine),
+        );
         refreshBuffLabel();
         cancelAim();
         return;
@@ -718,7 +790,11 @@ export default function Ball({
         mimicLeftRef.current = MIMIC_TURNS - 1;
         nextTierRef.current = tier;
         setNextTierId(tier);
-        recorderRef.current.recordSkill('mimic', { pokemonType: tier });
+        recorderRef.current.recordSkill(
+          'mimic',
+          { phase: 'cast', pokemonType: tier },
+          replaySimTime(engine),
+        );
         refreshBuffLabel();
         cancelAim();
         return;
@@ -745,7 +821,16 @@ export default function Ball({
           nextTierRef.current = reroll();
           setNextTierId(nextTierRef.current);
         }
-        recorderRef.current.recordSkill('bind', { pokemonType: tier });
+        recorderRef.current.recordSkill(
+          'bind',
+          {
+            phase: 'cast',
+            pokemonType: tier,
+            currentTier: currentTierRef.current,
+            nextTier: nextTierRef.current,
+          },
+          replaySimTime(engine),
+        );
         refreshBuffLabel();
         cancelAim();
       }
@@ -776,6 +861,11 @@ export default function Ball({
     syncPp(0);
     setOver(false);
     gameOverRef.current = false;
+    const engine = engineRef.current;
+    const runner = runnerRef.current;
+    // 녹화 타임스탬프 = Matter sim clock. 시작 시 0으로 맞춰 재생과 동일 기준으로.
+    if (engine) resetSimClock(engine);
+    if (runner && engine) restartRunner(runner, engine);
 
     const seed = createReplaySeed();
     rngRef.current = createSeededRandom(seed);
@@ -837,9 +927,8 @@ export default function Ball({
     setPlaybackDurationMs(1);
     const runner = runnerRef.current;
     const engine = engineRef.current;
-    if (runner && engine) {
-      Runner.run(runner, engine);
-    }
+    if (engine) engine.timing.timeScale = 1;
+    if (runner && engine) restartRunner(runner, engine);
   }, [clearPlaybackFinishTimer]);
 
   const goIdle = useCallback(() => {
@@ -922,18 +1011,68 @@ export default function Ball({
 
       if (action.type === 'SKILL') {
         const id = action.skillId as SkillId;
+        const phase = action.phase ?? 'cast';
+
+        if (phase === 'aim') {
+          if (id === 'shrink' || id === 'trick' || id === 'blowAway') {
+            aimModeRef.current = id;
+            trickPickRef.current = null;
+            setAimMode(id);
+            setAimHint(
+              id === 'shrink'
+                ? '작아질 공을 보드에서 클릭'
+                : id === 'trick'
+                  ? '서로 바꿀 공 2개를 순서대로 클릭'
+                  : '바꿀 공을 선택하세요',
+            );
+          }
+          return;
+        }
+
+        if (phase === 'pick' && id === 'trick' && action.x != null && action.y != null) {
+          const pick = findBallNear(action.x, action.y);
+          if (pick) {
+            trickPickRef.current = pick;
+            aimModeRef.current = 'trick';
+            setAimMode('trick');
+            setAimHint('두 번째 공을 선택하세요');
+          }
+          return;
+        }
+
+        // cast
+        const cost = getSkill(id).cost;
+        if (ppRef.current >= cost) {
+          syncPp(ppRef.current - cost);
+        }
+
         if (id === 'blowAway' && action.pokemonType != null) {
           currentTierRef.current = action.pokemonType;
           setCurrentTierId(action.pokemonType);
           spawnPreview();
+          cancelAim();
           return;
         }
-        if (id === 'shrink' && action.x != null && action.y != null && action.toTier != null) {
+        if (
+          id === 'shrink' &&
+          action.x != null &&
+          action.y != null &&
+          action.toTier != null
+        ) {
+          // 녹화 시 Math.floor(rng * tierId) 1회 소비분
+          rngRef.current();
           const target = findBallNear(action.x, action.y);
           if (target) replaceBallTier(engine, target, action.toTier);
+          cancelAim();
           return;
         }
-        if (id === 'trick' && action.x != null && action.y != null && action.x2 != null && action.y2 != null) {
+        if (
+          id === 'trick' &&
+          action.x != null &&
+          action.y != null &&
+          action.x2 != null &&
+          action.y2 != null
+        ) {
           const a = findBallNear(action.x, action.y);
           const b = findBallNear(action.x2, action.y2);
           if (a && b && a.id !== b.id) {
@@ -946,38 +1085,60 @@ export default function Ball({
             Body.setVelocity(a, velB);
             Body.setVelocity(b, velA);
           }
+          cancelAim();
           return;
         }
         if (id === 'earthquake') {
-          const rand = rngRef.current;
           quakeSafeRef.current = true;
           quakeSafeUntilRef.current = performance.now() + 500;
-          for (const body of engine.world.bodies) {
-            if (!isFieldBall(body) || body.plugin.merging) continue;
-            const r = body.circleRadius ?? 0;
-            const minY = GAME_OVER_LINE_Y + r;
-            const liftY = Math.max(
-              minY,
-              Math.min(body.position.y, BOARD_HEIGHT * 0.55),
-            );
-            Body.setVelocity(body, {
-              x: (rand() - 0.5) * 14,
-              y: -8 - rand() * 5,
-            });
-            Body.setPosition(body, {
-              x: Math.min(
-                BOARD_WIDTH - 20,
-                Math.max(20, body.position.x + (rand() - 0.5) * 40),
-              ),
-              y: liftY,
-            });
-            clampBallToCutline(body);
+          const fieldBalls = engine.world.bodies.filter(
+            (body) => isFieldBall(body) && !body.plugin.merging,
+          );
+          const rand = rngRef.current;
+          if (action.quakes && action.quakes.length > 0) {
+            const n = Math.min(fieldBalls.length, action.quakes.length);
+            for (let i = 0; i < n; i += 1) {
+              const body = fieldBalls[i];
+              const q = action.quakes[i];
+              if (!body || !q) continue;
+              Body.setPosition(body, { x: q.x, y: q.y });
+              Body.setVelocity(body, { x: q.vx, y: q.vy });
+              clampBallToCutline(body);
+              // 녹화 시 공마다 rand 3회 소비 → 시드 스트림 동기화
+              rand();
+              rand();
+              rand();
+            }
+          } else {
+            // 구버전 리플레이 호환
+            for (const body of fieldBalls) {
+              const r = body.circleRadius ?? 0;
+              const minY = GAME_OVER_LINE_Y + r;
+              const liftY = Math.max(
+                minY,
+                Math.min(body.position.y, BOARD_HEIGHT * 0.55),
+              );
+              Body.setVelocity(body, {
+                x: (rand() - 0.5) * 14,
+                y: -8 - rand() * 5,
+              });
+              Body.setPosition(body, {
+                x: Math.min(
+                  BOARD_WIDTH - 20,
+                  Math.max(20, body.position.x + (rand() - 0.5) * 40),
+                ),
+                y: liftY,
+              });
+              clampBallToCutline(body);
+            }
           }
+          cancelAim();
           return;
         }
         if (id === 'trickRoom') {
           trickRoomLeftRef.current = TRICK_ROOM_TURNS;
           refreshBuffLabel();
+          cancelAim();
           return;
         }
         if (id === 'mimic' && action.pokemonType != null) {
@@ -986,17 +1147,53 @@ export default function Ball({
           nextTierRef.current = action.pokemonType;
           setNextTierId(action.pokemonType);
           refreshBuffLabel();
+          cancelAim();
           return;
         }
         if (id === 'bind' && action.pokemonType != null) {
-          bindTierRef.current = action.pokemonType;
+          const tier = action.pokemonType;
+          bindTierRef.current = tier;
           bindLeftRef.current = BIND_TURNS;
-          setBoundTierId(action.pokemonType);
+          setBoundTierId(tier);
+          const reroll = () =>
+            randomDropTierId({
+              boostLowTiers: trickRoomLeftRef.current > 0,
+              excludeTierId: tier,
+              random: rngRef.current,
+            });
+          if (action.currentTier != null && action.nextTier != null) {
+            // 녹화본 티어 적용 + 녹화 때와 같은 횟수로 RNG 소비
+            if (currentTierRef.current === tier) reroll();
+            if (nextTierRef.current === tier) reroll();
+            currentTierRef.current = action.currentTier;
+            nextTierRef.current = action.nextTier;
+            setCurrentTierId(action.currentTier);
+            setNextTierId(action.nextTier);
+          } else {
+            if (currentTierRef.current === tier) {
+              currentTierRef.current = reroll();
+              setCurrentTierId(currentTierRef.current);
+            }
+            if (nextTierRef.current === tier) {
+              nextTierRef.current = reroll();
+              setNextTierId(nextTierRef.current);
+            }
+          }
+          spawnPreview();
           refreshBuffLabel();
+          cancelAim();
         }
       }
     },
-    [clampDropX, dropBallAt, findBallNear, spawnPreview, refreshBuffLabel],
+    [
+      clampDropX,
+      dropBallAt,
+      findBallNear,
+      spawnPreview,
+      refreshBuffLabel,
+      syncPp,
+      cancelAim,
+    ],
   );
 
   const readPlaybackElapsed = useCallback(() => {
@@ -1024,25 +1221,69 @@ export default function Ball({
       playbackPausedRef.current = false;
       playbackRef.current = null;
       playbackDataRef.current = null;
+      const engine = engineRef.current;
+      const runner = runnerRef.current;
+      if (engine) engine.timing.timeScale = 1;
+      // 재생 중에는 Runner를 끄고 수동 물리만 돌렸으므로 라이브용으로 재기동
+      if (runner && engine) restartRunner(runner, engine);
       setPlaybackPaused(false);
       setPhase('idle');
       onReplayFinished?.();
     }, 800);
   }, [clearPlaybackFinishTimer, onReplayFinished]);
 
+  const applyDuePlaybackActions = useCallback(
+    (upToTime: number, options?: { immediatePreview?: boolean }) => {
+      const pb = playbackRef.current;
+      if (!pb) return;
+      while (pb.index < pb.actions.length) {
+        const action = pb.actions[pb.index];
+        if (!action || action.time > upToTime) break;
+        pb.index += 1;
+        applyPlaybackAction(action, options);
+      }
+    },
+    [applyPlaybackAction],
+  );
+
+  /** 고정 스텝으로 물리 진행 + 스텝 경계에서 액션 적용 (라이브 Runner와 동일) */
+  const catchUpPlaybackSimulation = useCallback(
+    (targetMs: number, options?: { immediatePreview?: boolean }) => {
+      const engine = engineRef.current;
+      if (!engine) return;
+
+      // 시크는 한 번에 맞추고, 일반 재생은 프레임당 상한으로 UI 멈춤 방지
+      const maxSteps = options?.immediatePreview ? 200_000 : 12;
+      let steps = 0;
+
+      while (
+        engine.timing.timestamp + PLAYBACK_SIM_STEP_MS <= targetMs + 1e-6 &&
+        steps < maxSteps
+      ) {
+        applyDuePlaybackActions(engine.timing.timestamp, options);
+        stepPlaybackPhysicsOnce(engine);
+        steps += 1;
+      }
+
+      // 아직 물리 캐치업 중이면 미래 액션을 먼저 넣지 않음 (겹침→튕김 방지)
+      if (engine.timing.timestamp + PLAYBACK_SIM_STEP_MS > targetMs) {
+        applyDuePlaybackActions(targetMs, options);
+      }
+    },
+    [applyDuePlaybackActions],
+  );
+
   const runPlaybackTick = useCallback(() => {
     const tick = () => {
       const pb = playbackRef.current;
-      if (!pb || !isPlaybackRef.current || playbackPausedRef.current) return;
+      const engine = engineRef.current;
+      if (!pb || !engine || !isPlaybackRef.current || playbackPausedRef.current) {
+        return;
+      }
 
       const elapsed = readPlaybackElapsed();
       pb.elapsed = elapsed;
-      while (pb.index < pb.actions.length) {
-        const action = pb.actions[pb.index];
-        if (!action || action.time > elapsed) break;
-        pb.index += 1;
-        applyPlaybackAction(action);
-      }
+      catchUpPlaybackSimulation(elapsed);
 
       const now = performance.now();
       if (now - playbackUiStampRef.current > 80) {
@@ -1052,13 +1293,20 @@ export default function Ball({
 
       if (pb.index >= pb.actions.length) {
         setPlaybackElapsedMs(elapsed);
+        // 마지막 낙하·안착이 라이브와 같은 속도로 이어지게 Runner 복구
+        const runner = runnerRef.current;
+        if (runner) restartRunner(runner, engine);
         finishPlayback();
         return;
       }
       playbackRafRef.current = requestAnimationFrame(tick);
     };
     playbackRafRef.current = requestAnimationFrame(tick);
-  }, [applyPlaybackAction, finishPlayback, readPlaybackElapsed]);
+  }, [
+    catchUpPlaybackSimulation,
+    finishPlayback,
+    readPlaybackElapsed,
+  ]);
 
   const resetPlaybackScene = useCallback(
     (data: ReplayData) => {
@@ -1083,6 +1331,9 @@ export default function Ball({
       gameOverRef.current = false;
       droppingRef.current = false;
       recorderRef.current.reset();
+
+      const engine = engineRef.current;
+      if (engine) resetSimClock(engine);
 
       rngRef.current = createSeededRandom(data.seed);
       maxGradeRef.current = 0;
@@ -1134,32 +1385,15 @@ export default function Ball({
       setPlaybackPaused(true);
 
       resetPlaybackScene(data);
+      pb.index = 0;
+      catchUpPlaybackSimulation(t, { immediatePreview: true });
 
-      let cursor = 0;
-      let targetIndex = 0;
-      while (
-        targetIndex < pb.actions.length &&
-        (pb.actions[targetIndex]?.time ?? 0) <= t
-      ) {
-        const action = pb.actions[targetIndex];
-        if (!action) break;
-        const gap = Math.max(0, action.time - cursor);
-        if (gap > 0) advancePlaybackPhysics(engine, gap);
-        applyPlaybackAction(action, { immediatePreview: true });
-        cursor = action.time;
-        targetIndex += 1;
-      }
-
-      const tail = Math.max(0, t - cursor);
-      if (tail > 0) advancePlaybackPhysics(engine, tail);
-
-      pb.index = targetIndex;
       syncPlaybackClock(t);
       setPlaybackElapsedMs(t);
     },
     [
       resetPlaybackScene,
-      applyPlaybackAction,
+      catchUpPlaybackSimulation,
       syncPlaybackClock,
       clearPlaybackFinishTimer,
     ],
@@ -1192,6 +1426,7 @@ export default function Ball({
       playbackRafRef.current = null;
     }
     clearPlaybackFinishTimer();
+    // 재생 물리는 tick에서만 돌리므로 Runner는 계속 멈춤
     const runner = runnerRef.current;
     if (runner) Runner.stop(runner);
   }, [clearPlaybackFinishTimer, readPlaybackElapsed]);
@@ -1204,8 +1439,9 @@ export default function Ball({
     setPlaybackPaused(false);
     syncPlaybackClock(pb.elapsed);
     const runner = runnerRef.current;
+    if (runner) Runner.stop(runner);
     const engine = engineRef.current;
-    if (runner && engine) Runner.run(runner, engine);
+    if (engine) engine.timing.timeScale = 1;
 
     if (pb.index >= pb.actions.length) {
       finishPlayback();
@@ -1249,6 +1485,9 @@ export default function Ball({
       isPlaybackRef.current = true;
       playbackPausedRef.current = false;
       playingRef.current = true;
+      // 새 재생은 1배속으로 시작 (이전에 올린 배속이 남아 빨라 보이던 문제 방지)
+      playbackRateRef.current = 1;
+      setPlaybackRateState(1);
       setPlaybackPaused(false);
       setPlaybackDurationMs(duration);
       setPlaybackElapsedMs(0);
@@ -1262,9 +1501,11 @@ export default function Ball({
       };
       syncPlaybackClock(0);
 
+      // Runner 중첩 run이 낙하만 배속 시키던 원인 → 재생 중엔 끄고 tick으로만 물리
       const runner = runnerRef.current;
       const engine = engineRef.current;
-      if (runner && engine) Runner.run(runner, engine);
+      if (runner) Runner.stop(runner);
+      if (engine) resetSimClock(engine);
       runPlaybackTick();
     },
     [stopPlaybackLoop, resetPlaybackScene, runPlaybackTick, syncPlaybackClock],
@@ -1316,7 +1557,7 @@ export default function Ball({
     if (!host) return;
 
     const engine = Engine.create({
-      gravity: { x: 0, y: 1.05, scale: 0.001 },
+      gravity: { x: 0, y: 1.02, scale: 0.001 },
     });
     engineRef.current = engine;
 
@@ -1369,6 +1610,8 @@ export default function Ball({
 
     Composite.add(engine.world, [floor, left, right]);
 
+    // isFixed면 고주사율에서 물리만 빨라져 재생 액션 타임라인과 어긋남.
+    // 기본 러너(실경과 기반)로 라이브·재생 낙하 속도를 같게 유지.
     const runner = Runner.create();
     runnerRef.current = runner;
     Render.run(render);

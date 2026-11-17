@@ -1,3 +1,12 @@
+export type ReplaySkillPhase = 'aim' | 'pick' | 'cast';
+
+export type ReplayQuakeBody = {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+};
+
 export type ReplayAction =
   | { time: number; type: 'MOVE'; x: number }
   | { time: number; type: 'DROP'; x: number; pokemonType: number }
@@ -5,6 +14,8 @@ export type ReplayAction =
       time: number;
       type: 'SKILL';
       skillId: string;
+      /** aim=조준 시작, pick=중간 선택(트릭 1번째), cast/생략=실제 시전 */
+      phase?: ReplaySkillPhase;
       x?: number;
       y?: number;
       x2?: number;
@@ -12,6 +23,11 @@ export type ReplayAction =
       pokemonType?: number;
       fromTier?: number;
       toTier?: number;
+      /** 사슬묶기 후 현재/다음 공 */
+      currentTier?: number;
+      nextTier?: number;
+      /** 지진 직후 공 위치·속도 (재생 결정론) */
+      quakes?: ReplayQuakeBody[];
     };
 
 export type ReplayData = {

@@ -1,5 +1,6 @@
 const GUEST_KEY = 'pokesuika:guest-id';
 const GUEST_USER_UUID_KEY = 'pokesuika:guest-user-uuid';
+const GUEST_USER_UUID_HISTORY_KEY = 'pokesuika:guest-user-uuid-history';
 const GUEST_PATTERN = /^guest\d{5}$/;
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -10,6 +11,61 @@ export type GuestIdentity = {
   /** game_replays.user_id 에 저장·조회하는 UUID */
   userId: string;
 };
+
+function rememberGuestUserId(userId: string) {
+  if (typeof window === 'undefined') return;
+  if (!UUID_PATTERN.test(userId)) return;
+
+  let history: string[] = [];
+  try {
+    const raw = window.localStorage.getItem(GUEST_USER_UUID_HISTORY_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as unknown;
+      if (Array.isArray(parsed)) {
+        history = parsed.filter(
+          (id): id is string => typeof id === 'string' && UUID_PATTERN.test(id),
+        );
+      }
+    }
+  } catch {
+    history = [];
+  }
+
+  if (!history.includes(userId)) {
+    history = [userId, ...history].slice(0, 20);
+    window.localStorage.setItem(
+      GUEST_USER_UUID_HISTORY_KEY,
+      JSON.stringify(history),
+    );
+  }
+}
+
+/** 이 브라우저에서 썼던 게스트 UUID 들 (기록 목록 병합용) */
+export function getGuestUserIdHistory(): string[] {
+  if (typeof window === 'undefined') return [];
+
+  const current = window.localStorage.getItem(GUEST_USER_UUID_KEY);
+  let history: string[] = [];
+  try {
+    const raw = window.localStorage.getItem(GUEST_USER_UUID_HISTORY_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as unknown;
+      if (Array.isArray(parsed)) {
+        history = parsed.filter(
+          (id): id is string => typeof id === 'string' && UUID_PATTERN.test(id),
+        );
+      }
+    }
+  } catch {
+    history = [];
+  }
+
+  if (current && UUID_PATTERN.test(current) && !history.includes(current)) {
+    history = [current, ...history];
+  }
+
+  return history;
+}
 
 /** 비로그인 게스트 표시 ID (예: guest01234). localStorage 에 유지. */
 export function getOrCreateGuestId(): string {
@@ -34,11 +90,13 @@ export function getOrCreateGuestUserId(): string {
 
   const existing = window.localStorage.getItem(GUEST_USER_UUID_KEY);
   if (existing && UUID_PATTERN.test(existing)) {
+    rememberGuestUserId(existing);
     return existing;
   }
 
   const id = crypto.randomUUID();
   window.localStorage.setItem(GUEST_USER_UUID_KEY, id);
+  rememberGuestUserId(id);
   return id;
 }
 

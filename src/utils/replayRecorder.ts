@@ -32,15 +32,21 @@ export class ReplayRecorder {
     this.skills = [];
     this.seed = 0;
     this.lastMoveX = null;
+    this.lastMoveAt = -Infinity;
   }
 
+  /** wall-clock 폴백 (가능하면 Matter sim timestamp 를 넘길 것) */
   private now(): number {
     return Math.max(0, Math.round(performance.now() - this.startedAt));
   }
 
-  recordMove(x: number) {
+  private stamp(timeMs?: number): number {
+    return Math.max(0, Math.round(timeMs ?? this.now()));
+  }
+
+  recordMove(x: number, timeMs?: number) {
     if (!this.active) return;
-    const t = this.now();
+    const t = this.stamp(timeMs);
     const rounded = Math.round(x);
     if (
       this.lastMoveX != null &&
@@ -54,10 +60,10 @@ export class ReplayRecorder {
     this.actions.push({ time: t, type: 'MOVE', x: rounded });
   }
 
-  recordDrop(x: number, pokemonType: number) {
+  recordDrop(x: number, pokemonType: number, timeMs?: number) {
     if (!this.active) return;
     this.actions.push({
-      time: this.now(),
+      time: this.stamp(timeMs),
       type: 'DROP',
       x: Math.round(x),
       pokemonType,
@@ -66,11 +72,15 @@ export class ReplayRecorder {
 
   recordSkill(
     skillId: string,
-    extra?: Omit<Extract<ReplayAction, { type: 'SKILL' }>, 'time' | 'type' | 'skillId'>,
+    extra?: Omit<
+      Extract<ReplayAction, { type: 'SKILL' }>,
+      'time' | 'type' | 'skillId'
+    >,
+    timeMs?: number,
   ) {
     if (!this.active) return;
     this.actions.push({
-      time: this.now(),
+      time: this.stamp(timeMs),
       type: 'SKILL',
       skillId,
       ...extra,
@@ -78,6 +88,10 @@ export class ReplayRecorder {
   }
 
   durationSec(): number {
+    if (this.actions.length > 0) {
+      const last = this.actions[this.actions.length - 1]?.time ?? 0;
+      return Math.max(1, Math.round(last / 1000));
+    }
     if (this.startedAt <= 0) return 0;
     return Math.max(1, Math.round((performance.now() - this.startedAt) / 1000));
   }

@@ -5,6 +5,9 @@ import ModalFrame from '../ModalFrame';
 
 type modal = {
   title: string;
+  confirmLabel?: string;
+  cancelLabel?: string;
+  danger?: boolean;
   onConfirm?: () => void | Promise<void>;
   onCancel?: () => void | Promise<void>;
 };
@@ -12,10 +15,13 @@ type modal = {
 const ConfirmModal = ({
   setOnModal,
   dimClick,
-  isDim = false,
+  isDim = true,
   className,
   title,
   children,
+  confirmLabel = '확인',
+  cancelLabel = '취소',
+  danger = false,
   onConfirm,
   onCancel,
 }: ChildrenModalType & modal) => {
@@ -32,7 +38,11 @@ const ConfirmModal = ({
       <div className="mt-6 flex gap-3">
         <button
           type="button"
-          className="rounded-full bg-emerald-500 px-4 py-1.5 text-sm font-semibold text-slate-950 hover:bg-emerald-400"
+          className={
+            danger
+              ? 'rounded-full bg-rose-500 px-4 py-1.5 text-sm font-semibold text-white hover:bg-rose-400'
+              : 'rounded-full bg-emerald-500 px-4 py-1.5 text-sm font-semibold text-slate-950 hover:bg-emerald-400'
+          }
           onClick={async () => {
             try {
               await onConfirm?.();
@@ -41,7 +51,7 @@ const ConfirmModal = ({
             }
           }}
         >
-          확인
+          {confirmLabel}
         </button>
         <button
           type="button"
@@ -54,7 +64,7 @@ const ConfirmModal = ({
             }
           }}
         >
-          취소
+          {cancelLabel}
         </button>
       </div>
     </ModalFrame>
